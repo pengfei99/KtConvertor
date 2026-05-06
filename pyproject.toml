@@ -1,0 +1,44 @@
+[project]
+name = "ktconvertor"
+version = "0.1.0"
+description = "This tool can convert kerberos ticket of format .kirbi to standard MIT CCACHE format"
+readme = "README.md"
+requires-python = ">=3.11"
+
+authors = [
+    { name = "Pengfei Liu", email = "pengfei.liu@casd.eu" }
+]
+license = { text = "MIT" }
+
+keywords = ["kerberos", "ccache", ]
+
+dependencies = ["pyasn1", "minikerberos","asn1crypto", "typer"
+]
+
+[project.optional-dependencies]
+# Development dependencies (install with: pip install -e ".[dev]")
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "black>=23.0", # Code formatter
+    "isort>=5.12", # Import sorter
+    "mypy>=1.0", # Added for type checking
+]
+
+[project.scripts]
+# This allows the user to run 'convert-tgt' directly in the terminal
+convert-tgt = "ktconvertor.main:app"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+# Modern project tip: Add configuration for your tools here
+[tool.black]
+line-length = 88
+
+[tool.isort]
+profile = "black"
+
+[tool.setuptools.packages.find]
+where = ["src"]  # Tells setuptools to look inside the src folder

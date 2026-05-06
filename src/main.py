@@ -4,7 +4,7 @@ from typing import Optional
 from rich.console import Console
 
 # Adjust the import to match your package structure
-from krbconvertor.convertor import convert_kirbi
+from ktconvertor.convertor import convert_kirbi
 
 # Initialize console for professional-looking output
 console = Console()

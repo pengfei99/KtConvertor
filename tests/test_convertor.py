@@ -1,4 +1,4 @@
-from krbconvertor.convertor import convert_kirbi
+from ktconvertor.convertor import convert_kirbi
 
 
 def test_convertor_with_given_path():

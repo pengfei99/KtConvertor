@@ -5,7 +5,7 @@ from unittest.mock import patch, MagicMock
 from pathlib import Path
 
 
-from krbconvertor.convertor import gen_cache_path
+from ktconvertor.convertor import gen_cache_path
 
 
 class TestGenCachePath:
