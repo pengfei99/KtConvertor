@@ -115,4 +115,10 @@ def convert_kirbi(src:str, dest:str=None)->str:
     final_path = dest_path.as_posix()
     cc.to_file(final_path)
 
+    # 7. Final Validation: CCaches must have a minimum size
+    # An empty or tiny file (e.g., < 100 bytes) will cause Java's EOFException
+    if dest_path.stat().st_size < 128:
+        raise ValueError(f"Generated cache at {dest_path} is suspiciously small. "
+                         "The source Kirbi might not contain a valid TGT.")
+
     return final_path
