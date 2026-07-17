@@ -1,6 +1,10 @@
-"""
-Standalone kirbi → ccache converter.
-Zero dependencies beyond Python stdlib.
+"""Standalone .kirbi to MIT ccache credential converter.
+
+This module parses a Kerberos V5 KRB-CRED (.kirbi) structure—often exported by
+tools like Rubeus—and reconstructs it into a standard MIT ccache file usable by
+native Kerberos stacks and Hadoop/HDFS clients.
+
+Zero dependencies beyond the Python standard library.
 
 Usage:
   python kirbi2ccache.py ticket.kirbi            # writes ticket.ccache
@@ -8,17 +12,29 @@ Usage:
   python kirbi2ccache.py input.kirbi             # also handles base64 (Rubeus)
 """
 
+from __future__ import annotations
+
+import base64
+import datetime
+import os
 import struct
 import sys
-import os
-import datetime
-import base64
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+# ── Type Aliases for Enhanced Scannability ───────────────────────────
+PrincipalInfo = Tuple[int, List[str]]
+KeyBlock = Tuple[int, bytes]
+KrbCredInfo = Dict[str, Any]
 
 
 # ── Minimal DER TLV parser ──────────────────────────────────────────
 
 class TLV:
+    """
+    Represents an ASN.1 DER Tag-Length-Value node with absolute data offsets.
+    """
     __slots__ = ('tag', 'start', 'end', 'tag_class', 'constructed', 'tag_num', 'value')
+
     def __init__(self, tag, start, end, value):
         self.tag = tag
         self.start = start
@@ -29,10 +45,19 @@ class TLV:
         self.value = value
 
     def __repr__(self):
-        return f'TLV(tag=0x{self.tag:02x} class={self.tag_class} constructed={self.constructed} num={self.tag_num} len={self.end-self.start})'
+        return (
+            f"TLV(tag=0x{self.tag:02x} class={self.tag_class} "
+            f"constructed={self.constructed} num={self.tag_num} "
+            f"len={self.end - self.start})")
 
 
-def parse_der(data, offset=0):
+def parse_der(data: bytes, offset: int = 0) -> Tuple[TLV, int]:
+    """
+    Parses a single ASN.1 DER element from a byte string using absolute offsets.
+    :param data: The complete raw input bytes.
+    :param offset: The absolute starting index to parse from.
+    :return: A tuple containing the parsed TLV object and the next absolute offset integer.
+    """
     start = offset
     tag = data[offset]
     offset += 1
@@ -65,11 +90,12 @@ def parse_der(data, offset=0):
     elif tag == 0x18:  # GeneralizedTime
         value = data[offset:end].decode('ascii', errors='replace')
     elif tag == 0x30 or (tag & 0x20):  # SEQUENCE / SEQUENCE OF / Constructed context-specific
-        value = []
+        value_list: List[TLV] = []
         o = offset
         while o < end:
             child, o = parse_der(data, o)
-            value.append(child)
+            value_list.append(child)
+        value = value_list
     else:
         value = data[offset:end]
 
@@ -78,20 +104,37 @@ def parse_der(data, offset=0):
 
 # ── Navigators ──────────────────────────────────────────────────────
 
-def find_tag(children, tag_num, tag_class=2):
+def find_tag(children: List[TLV], tag_num: int, tag_class: int = 2) -> Optional[TLV]:
+    """
+    Searches a list of TLV nodes for a specific tag number and class.
+    :param children: A list of TLV objects to inspect.
+    :param tag_num: The target identifier tag number.
+    :param tag_class: The expected class bits (defaults to 2 for context-specific).
+    :return: The matching TLV object if found, otherwise None.
+    """
     for c in children:
         if c.tag_num == tag_num and c.tag_class == tag_class:
             return c
     return None
 
-def unwrap_seq(tlv):
-    """Given a context/application tag wrapping a SEQUENCE, return the SEQUENCE."""
+
+def unwrap_seq(tlv: TLV) -> Optional[TLV]:
+    """
+    Extracts the inner SEQUENCE element wrapped inside a constructed node.
+    :param tlv: The outer constructed TLV node container.
+    :return: The primary inner child TLV object if constructed, otherwise None.
+    """
     if tlv.constructed and len(tlv.value) > 0:
         return tlv.value[0]
     return None
 
-def unwrap_prim(tlv):
-    """Given a context tag wrapping a primitive, return the inner TLV."""
+
+def unwrap_prim(tlv: TLV) -> Optional[TLV]:
+    """
+    Extracts the internal primitive TLV leaf element from a context tag wrapper.
+    :param tlv: The outer contextual TLV wrapper node.
+    :return: The core inner child TLV object, or None if empty or unconstructed.
+    """
     if tlv.constructed and len(tlv.value) > 0:
         return tlv.value[0]
     return None
@@ -99,9 +142,14 @@ def unwrap_prim(tlv):
 
 # ── Parsers ─────────────────────────────────────────────────────────
 
-def parse_principal(seq_tlv):
-    """Return (name_type: int, name_string: list[str])"""
-    nt = 0; ns = []
+def parse_principal(seq_tlv: TLV) -> PrincipalInfo:
+    """
+    Parses a Kerberos Principal name sequence structure.
+    :param seq_tlv: The TLV object representing the Principal sequence block.
+    :return: A tuple containing the type integer and list of string components.
+    """
+    nt = 0
+    ns: List[str] = []
     for c in seq_tlv.value:
         if c.tag_num == 0 and c.tag_class == 2:
             nt = unwrap_prim(c).value
@@ -113,7 +161,12 @@ def parse_principal(seq_tlv):
     return nt, ns
 
 
-def parse_kerberostime(gt_str):
+def parse_kerberostime(gt_str: Optional[str]) -> int:
+    """
+    Converts a standard Kerberos GeneralizedTime string into a Unix epoch timestamp.
+    :param gt_str: The raw ASN.1 timestamp string (e.g., '20260717114425Z').
+    :return: An integer representing the Unix timestamp, or 0 if parsing fails or input is empty.
+    """
     if not gt_str:
         return 0
     s = gt_str.rstrip('Z')
@@ -126,46 +179,79 @@ def parse_kerberostime(gt_str):
         return 0
 
 
-def parse_krbcredinfo(seq_tlv):
-    info = {}
+def parse_krbcredinfo(seq_tlv: TLV) -> KrbCredInfo:
+    """
+    Maps fields from a KrbCredInfo sequence block into a key-value dictionary.
+    :param seq_tlv: The TLV representation of the individual KrbCredInfo sequence block.
+    :return: A dictionary containing extracted metadata fields such as times, names, and keys.
+    """
+    info: KrbCredInfo = {}
     for c in seq_tlv.value:
         if c.tag_num == 0 and c.tag_class == 2:  # key
             ks = unwrap_seq(c)  # EncryptionKey SEQUENCE
             if ks:
-                kt = 0; kv = b''
+                kt = 0
+                kv = b''
                 for kf in ks.value:
                     if kf.tag_num == 0 and kf.tag_class == 2:
-                        kt = unwrap_prim(kf).value
+                        inner_kt = unwrap_prim(kf)
+                        if inner_kt:
+                            kt = inner_kt.value
                     elif kf.tag_num == 1 and kf.tag_class == 2:
-                        kv = unwrap_prim(kf).value
+                        inner_kv = unwrap_prim(kf)
+                        if inner_kv:
+                            kv = inner_kv.value
                 info['key'] = (kt, kv)
         elif c.tag_num == 1 and c.tag_class == 2:  # prealm
-            info['prealm'] = unwrap_prim(c).value
-        elif c.tag_num == 2 and c.tag_class == 2:  # pname
-            info['pname'] = parse_principal(unwrap_seq(c))
-        elif c.tag_num == 3 and c.tag_class == 2:  # flags
-            info['flags'] = unwrap_prim(c).value
-        elif c.tag_num == 4 and c.tag_class == 2:  # authtime
-            info['authtime'] = parse_kerberostime(unwrap_prim(c).value)
-        elif c.tag_num == 5 and c.tag_class == 2:  # starttime
-            info['starttime'] = parse_kerberostime(unwrap_prim(c).value)
-        elif c.tag_num == 6 and c.tag_class == 2:  # endtime
-            info['endtime'] = parse_kerberostime(unwrap_prim(c).value)
-        elif c.tag_num == 7 and c.tag_class == 2:  # renew_till
-            info['renew_till'] = parse_kerberostime(unwrap_prim(c).value)
-        elif c.tag_num == 8 and c.tag_class == 2:  # srealm
-            info['srealm'] = unwrap_prim(c).value
-        elif c.tag_num == 9 and c.tag_class == 2:  # sname
-            info['sname'] = parse_principal(unwrap_seq(c))
+            inner = unwrap_prim(c)
+            if inner:
+                info['prealm'] = inner.value
+            elif c.tag_num == 2 and c.tag_class == 2:  # pname
+                inner_seq = unwrap_seq(c)
+                if inner_seq:
+                    info['pname'] = parse_principal(inner_seq)
+            elif c.tag_num == 3 and c.tag_class == 2:  # flags
+                inner = unwrap_prim(c)
+                if inner:
+                    info['flags'] = inner.value
+            elif c.tag_num == 4 and c.tag_class == 2:  # authtime
+                inner = unwrap_prim(c)
+                if inner:
+                    info['authtime'] = parse_kerberostime(inner.value)
+            elif c.tag_num == 5 and c.tag_class == 2:  # starttime
+                inner = unwrap_prim(c)
+                if inner:
+                    info['starttime'] = parse_kerberostime(inner.value)
+            elif c.tag_num == 6 and c.tag_class == 2:  # endtime
+                inner = unwrap_prim(c)
+                if inner:
+                    info['endtime'] = parse_kerberostime(inner.value)
+            elif c.tag_num == 7 and c.tag_class == 2:  # renew_till
+                inner = unwrap_prim(c)
+                if inner:
+                    info['renew_till'] = parse_kerberostime(inner.value)
+            elif c.tag_num == 8 and c.tag_class == 2:  # srealm
+                inner = unwrap_prim(c)
+                if inner:
+                    info['srealm'] = inner.value
+            elif c.tag_num == 9 and c.tag_class == 2:  # sname
+                inner_seq = unwrap_seq(c)
+                if inner_seq:
+                    info['sname'] = parse_principal(inner_seq)
     return info
 
 
-def parse_krbcred(data):
+def parse_krbcred(data: bytes) -> Tuple[List[bytes], List[KrbCredInfo]]:
+    """
+    Extracts raw ticket payloads and credential metadata blocks from a KRB-CRED container.
+    :param data: Raw unparsed KRB-CRED file byte array.
+    :return: A tuple containing a list of raw ticket byte structures and a list of parsed metadata dicts.
+    """
     outer, _ = parse_der(data)
     seq = outer.value[0] if outer.constructed else outer
 
-    tickets_raw = []
-    infos = []
+    tickets_raw: List[bytes] = []
+    infos: List[KrbCredInfo] = []
 
     for field in seq.value:
         if field.tag_num == 2 and field.tag_class == 2:  # tickets
@@ -195,7 +281,14 @@ def parse_krbcred(data):
 
 # ── CCACHE writer ───────────────────────────────────────────────────
 
-def p_principal(nt, realm, comps):
+def p_principal(nt: int, realm: str, comps: List[str]) -> bytes:
+    """
+    Serializes a Principal identity component into a standard MIT ccache byte layout.
+    :param nt: Name type identifier.
+    :param realm: Name of target authentication realm.
+    :param comps: List of nested sub-components inside name.
+    :return: Packed raw bytes matching the format structure.
+    """
     buf = struct.pack('>II', nt, len(comps))
     rb = realm.encode('utf-8')
     buf += struct.pack('>I', len(rb)) + rb
@@ -205,24 +298,52 @@ def p_principal(nt, realm, comps):
     return buf
 
 
-def p_keyblock(kt, kv):
+def p_keyblock(kt: int, kv: bytes) -> bytes:
+    """
+    Packs encryption keyblock type and value dimensions into structural bytes.
+    :param kt: Encryption mechanism identifier key type.
+    :param kv: The raw sequence payload byte array.
+    :return: MIT serialized representation of target key components.
+    """
     return struct.pack('>hhH', kt, 0, len(kv)) + kv
 
 
-def p_times(a, s, e, r):
+def p_times(a: int, s: int, e: int, r: int) -> bytes:
+    """
+    Packs key lifecycle timestamps into four 32-bit big-endian integers.
+    :param a: Authentication timeline anchor index.
+    :param s: Active initialization timeline index.
+    :param e: Terminal lifecycle bounding index.
+    :param r: Extended renewal threshold boundary point.
+    :return: Binary representation containing mapped timeline references.
+    """
     return struct.pack('>IIII', a, s, e, r)
 
 
-def p_octet(data):
+def p_octet(data: Union[str, bytes]) -> bytes:
+    """
+    Prefixes data length as a 32-bit big-endian integer over a byte stream.
+    :param data: Targeted raw string or raw byte payload array.
+    :return: Length-prefixed binary block string layout wrapper.
+    """
     if isinstance(data, str):
         data = data.encode('utf-8')
     return struct.pack('>I', len(data)) + data
 
 
-def kirbi_to_ccache(data):
+def kirbi_to_ccache(data: bytes) -> bytes:
+    """
+    Converts unparsed binary input data from .kirbi format into an MIT ccache structure.
+    Raises:
+    ValueError: If input credentials do not contain appropriate identity tracks.
+
+    :param data: Clean base64-decoded or direct structural source file contents.
+    :return: Fully packed payload ready to write directly to a credential cache destination.
+
+    """
     tickets_raw, infos = parse_krbcred(data)
     if not tickets_raw or not infos:
-        raise ValueError('No tickets or ticket-info in kirbi')
+        raise ValueError('No tickets or ticket-info located within the provided source structure.')
     info = infos[0]
     tkt_der = tickets_raw[0]
 
@@ -242,19 +363,19 @@ def kirbi_to_ccache(data):
     cc = struct.pack('>H', 0x0504)  # version (KRB5_FCC_FVNO_4)
     hdr = struct.pack('>HH', 1, 8) + b'\x00' * 8
     cc += struct.pack('>H', len(hdr)) + hdr
-    cc += p_principal(nt, prealm, ns)    # primary principal
-    cc += p_principal(nt, prealm, ns)    # client
+    cc += p_principal(nt, prealm, ns)  # primary principal
+    cc += p_principal(nt, prealm, ns)  # client
     cc += p_principal(snt, srealm, sns)  # server
     cc += p_keyblock(kt, kv)
     cc += p_times(
         info.get('authtime', 0), info.get('starttime', 0),
         info.get('endtime', 0), info.get('renew_till', 0))
-    cc += struct.pack('<B', 0)     # is_skey
-    cc += struct.pack('<I', flags) # tktflags (little-endian!)
-    cc += struct.pack('>I', 0)    # num_address
-    cc += struct.pack('>I', 0)    # num_authdata
+    cc += struct.pack('<B', 0)  # is_skey
+    cc += struct.pack('<I', flags)  # tktflags (little-endian!)
+    cc += struct.pack('>I', 0)  # num_address
+    cc += struct.pack('>I', 0)  # num_authdata
     cc += p_octet(tkt_der)
-    cc += p_octet(b'')            # second_ticket
+    cc += p_octet(b'')  # second_ticket
     return cc
 
 
