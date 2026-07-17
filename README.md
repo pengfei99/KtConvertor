@@ -2,8 +2,11 @@
 
 The objective of this project is to convert a kerberos ticket from format `.kirbi` to MIT Kerberos cache file. 
 
+There exist tools such as [impacket](https://github.com/fortra/impacket) which can do the same thing. Why I do this?
+Because `impacket` is considered as a virus by `Windows defender`.
 
 We use the `ccache.py` of the project [minikerberos](https://github.com/skelsec/minikerberos/blob/main/minikerberos/common/ccache.py)
+
 
 ## 🚀 Key Features
 
@@ -77,6 +80,8 @@ After installation, you can view all available options of the tool with `convert
 ## 📄 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+
 
 
 
