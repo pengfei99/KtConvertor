@@ -1,6 +1,10 @@
+import os
+
 import pytest
 
 from ktconvertor.convertor import convert_kirbi
+from minikerberos.common.ccache import CCACHE
+
 
 @pytest.fixture
 def ticket_src():
@@ -27,4 +31,13 @@ def test_convertor_with_default_path(ticket_src):
 
 def test_convertor_with_relative_path():
     kirbi = "./tests/tmp/tgt.kirbi"
-    convert_kirbi(kirbi)
+    out_path = "./tests/tmp/tgt.ccache"
+    convert_kirbi(kirbi,out_path)
+
+def test_origin_code():
+    kirbi = "./tests/tmp/tgt.kirbi"
+    ccache = "./tests/tmp/tgt.ccache"
+    abs_path = os.path.abspath(kirbi)
+    print(abs_path)
+    cc = CCACHE.from_kirbifile(abs_path)
+    cc.to_file(ccache)
