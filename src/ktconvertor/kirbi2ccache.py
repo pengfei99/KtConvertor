@@ -19,6 +19,7 @@ import datetime
 import os
 import struct
 import sys
+from enum import IntEnum
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 # ── Type Aliases for Enhanced Scannability ───────────────────────────
@@ -28,27 +29,52 @@ KrbCredInfo = Dict[str, Any]
 
 
 # ── Minimal DER TLV parser ──────────────────────────────────────────
+class ASN1Class(IntEnum):
+    """ASN.1 Tag Classes stored in Bits 7-6 of the Identifier Octet."""
+    UNIVERSAL = 0  # 0b00
+    APPLICATION = 1  # 0b01
+    CONTEXT = 2  # 0b10
+    PRIVATE = 3  # 0b11
+
 
 class TLV:
     """
     Represents an ASN.1 DER Tag-Length-Value node with absolute data offsets.
     """
+    # Bit masks for ASN.1 Identifier Octets
+    CLASS_MASK = 0xC0  # Bits 7-6: 1100 0000
+    CONSTRUCTED_MASK = 0x20  # Bit 5:    0010 0000
+    TAG_NUM_MASK = 0x1F  # Bits 4-0: 0001 1111
+
     __slots__ = ('tag', 'start', 'end', 'tag_class', 'constructed', 'tag_num', 'value')
 
-    def __init__(self, tag, start, end, value):
-        self.tag = tag
-        self.start = start
-        self.end = end
-        self.tag_class = tag >> 6
-        self.constructed = (tag >> 5) & 1
-        self.tag_num = tag & 0x1F
-        self.value = value
+    # In ASN.1 DER, every piece of data starts with an Identifier Octet (a single 8-bit byte).
+    # Rather than using a full byte for every piece of metadata, the creators of ASN.1 compressed three
+    # different pieces of information into that single 8-bit byte:
+    # """ Bit Position:   7   6   |   5   |   4   3   2   1   0
+    #                   ----------+-------+---------------------
+    #      Field Name:    Class    | Type  |     Tag Number"""
+    def __init__(self, tag: int, start: int, end: int, value: Any) -> None:
+        self.tag: int = tag
+        self.start: int = start
+        self.end: int = end
 
-    def __repr__(self):
+        # Extracts the Tag Class stored in the highest 2 bits (bits 7 and 6) of the byte
+        # >> 6 means pushes all bits in the byte to the right by 6 positions, discarding the bottom 6 bits entirely.
+        # for example
+        # Original Byte:   1 0 0 0 0 0 0 0  (Binary for 0x80)
+        # Shift right 6:   0 0 0 0 0 0 1 0  (Shifted 6 positions to the right)
+        # Result Decimal:  2                (Context-specific class)
+        self.tag_class: ASN1Class = ASN1Class((tag & self.CLASS_MASK) >> 6)
+        self.constructed: bool = bool(tag & self.CONSTRUCTED_MASK)
+        self.tag_num: int = tag & self.TAG_NUM_MASK
+        self.value: Any = value
+
+    def __repr__(self) -> str:
         return (
-            f"TLV(tag=0x{self.tag:02x} class={self.tag_class} "
-            f"constructed={self.constructed} num={self.tag_num} "
-            f"len={self.end - self.start})")
+            f"TLV(tag=0x{self.tag:02x}, class={self.tag_class.name}, "
+            f"constructed={self.constructed}, num={self.tag_num})"
+        )
 
 
 def parse_der(data: bytes, offset: int = 0) -> Tuple[TLV, int]:
@@ -344,6 +370,8 @@ def kirbi_to_ccache(data: bytes) -> bytes:
     tickets_raw, infos = parse_krbcred(data)
     if not tickets_raw or not infos:
         raise ValueError('No tickets or ticket-info located within the provided source structure.')
+    # todo here we only take the first ticket and discard the rest. We need to be able to process multiple
+    # ticket correctly in the future.
     info = infos[0]
     tkt_der = tickets_raw[0]
 
