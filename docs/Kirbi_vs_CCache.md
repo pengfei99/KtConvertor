@@ -1,66 +1,66 @@
-# kirbi2ccache — Architecture & File Format Reference
+# Architecture & File Format Reference
 
-## Overview
+To understand how to convert a Kerberos ticket from `Windows KIRBI format` to `MIT CCACHE format`, you need to 
+understand how both operating systems store Kerberos credentials.
 
-`kirbi2ccache.py` is a zero-dependency Python script that converts Kerberos
-credential files from **kirbi format** (Mimikatz/Rubeus) to **MIT ccache
-format** (the standard credential cache used by MIT krb5, Java's
-`sun.security.krb5`, and tools like `klist`).
+While both files store the exact same underlying `cryptographic elements(e.g. a ticket, a session key, and client/server identities)`,
+they wrap them in completely different `data formats`:
+- Windows KIRBI format uses nested, `binary-tagged ASN.1 DER` structures, 
+- MIT CCACHE format uses a `rigid, flat binary format built from big-endian length-prefixed fields`.
 
-```bash
-python kirbi2ccache.py ticket.kirbi          # → ticket.ccache
-python kirbi2ccache.py ticket.kirbi out.bin   # → out.bin
-python kirbi2ccache.py base64.kirbi           # Rubeus base64 input
+
+## 1. The Windows KIRBI Format (KRB-CRED)
+
+A `.kirbi` file is not a custom proprietary Windows binary format; it is a raw `RFC 4120 KRB-CRED (Kerberos Credential) ASN.1 DER structure`. 
+Security tools like `Rubeus` or `Mimikatz` export kerberos tickets in this format.
+
+Because it uses ASN.1 DER (Distinguished Encoding Rules), data is structured as a `tree of TLV (Tag-Length-Value) blocks`.
+
+### 1.1 Internal ASN.1 Structure (RFC 4120 §5.8) of KIRBI
+
+When you expand a .kirbi file, it looks like this nested tree:
+
+``` text
+[APPLICATION 22] (KRB-CRED Outer Envelope)
+└── SEQUENCE
+    ├── [0] pvno INTEGER (5)
+    ├── [1] msg-type INTEGER (22)
+    ├── [2] tickets SEQUENCE OF
+    │   └── Ticket [APPLICATION 1]  <-- The raw ticket passed to services!
+    │       ├── tkt-vno INTEGER (5)
+    │       ├── realm GeneralString
+    │       ├── sname PrincipalName
+    │       └── enc-part EncryptedData
+    └── [3] enc-part EncryptedData
+        └── EncKrbCredPart (Decrypted in Kirbi exports)
+            └── ticket-info SEQUENCE OF
+                └── KrbCredInfo
+                    ├── [0] key EncryptionKey (kt: Int, kv: Bytes)
+                    ├── [1] prealm GeneralString
+                    ├── [2] pname PrincipalName
+                    ├── [3] flags TicketFlags (BitString)
+                    ├── [4] authtime GeneralizedTime
+                    ├── [5] starttime GeneralizedTime
+                    ├── [6] endtime GeneralizedTime
+                    ├── [7] renew-till GeneralizedTime
+                    ├── [8] srealm GeneralString
+                    └── [9] sname PrincipalName
 ```
 
----
+Key Elements of KIRBI:
 
-## Kirbi File Format
+- `tickets` Block [2]: Contains the actual opaque ticket (often encrypted with the service account's hash, e.g., krbtgt). The client does not read inside this block; it simply passes these exact raw bytes to the Kerberos service (like HDFS).
 
-A kirbi file is a `DER-encoded` **KRB\_CRED** message (Kerberos protocol
-message type 22), wrapped in an `[APPLICATION 22]` explicit tag.
+- `EncKrbCredPart / ticket-info` Block [3]: Contains the `session metadata` the client needs to use the ticket:
 
-### ASN.1 Structure (RFC 4120 §5.8)
+     - The Session Key (key): Used to sign/encrypt communication between the client and HDFS. 
+     - The Client Identity (pname, prealm): Who owns this ticket. 
+     - The Timestamps (authtime, starttime, endtime, renew_till): Expressed as ISO-like GeneralizedTime strings (e.g., "20260720080000Z").
 
-```
-KRB-CRED ::= [APPLICATION 22] SEQUENCE {
-    pvno            [0] INTEGER (5),
-    msg-type        [1] INTEGER (22),
-    tickets         [2] SEQUENCE OF Ticket,
-    enc-part        [3] EncryptedData
-}
 
-EncryptedData ::= SEQUENCE {
-    etype   [0] INTEGER (0),
-    kvno    [1] INTEGER (OPTIONAL),
-    cipher  [2] OCTET STRING
-}
-```
+### 1.2 `EncKrbCredPart / ticket-info` Block Field Reference
 
-When `etype = 0` (no encryption — the usual case for exported kirbis), the
-`cipher` field contains a DER-encoded **EncKrbCredPart**:
-
-```
-EncKrbCredPart ::= [APPLICATION 29] SEQUENCE {
-    ticket-info  [0] SEQUENCE OF KrbCredInfo
-}
-
-KrbCredInfo ::= SEQUENCE {
-    key         [0] EncryptionKey,
-    prealm      [1] Realm (OPTIONAL),
-    pname       [2] PrincipalName (OPTIONAL),
-    flags       [3] TicketFlags (OPTIONAL),
-    authtime    [4] KerberosTime (OPTIONAL),
-    starttime   [5] KerberosTime (OPTIONAL),
-    endtime     [6] KerberosTime (OPTIONAL),
-    renew-till  [7] KerberosTime (OPTIONAL),
-    srealm      [8] Realm (OPTIONAL),
-    sname       [9] PrincipalName (OPTIONAL),
-    caddr      [10] HostAddresses (OPTIONAL)
-}
-```
-
-### Field Reference
+The `DER-encoded` field **EncKrbCredPart** only exists, When `etype = 0` (no encryption — the usual case for exported kirbis)
 
 | Tag | Field | Type | Description |
 |-----|-------|------|-------------|
@@ -75,34 +75,57 @@ KrbCredInfo ::= SEQUENCE {
 | `[8]` | srealm | `Realm` (string) | Service realm |
 | `[9]` | sname | `PrincipalName` | Service principal |
 
-### Binary Kirbi vs Base64 (Rubeus)
+### 1.3 Kirbi in Binary vs Base64
 
-Tools like Mimikatz write raw DER kirbis. Rubeus writes base64-encoded
-kirbis. The script auto-detects: it tries binary DER first, and falls back
-to base64 decode on parse failure.
+Tools like `Mimikatz` exports and writes kirbi file in `raw DER(binary)`, which is hard to copy and past via text editers. 
+As a result, tools like `Rubeus`, and `pypykatz` can export and write the kirbi file in `base64-encoded` plain-text file.
 
----
 
-## CCACHE File Format (MIT Credentials Cache v4)
+## 2. The MIT CCACHE Format (Version 4)
 
-Specification: part of MIT krb5 source (`cc_file.c`), implemented in Java's
-`sun.security.krb5.internal.ccache.FileCredentialsCache`.
+MIT Kerberos (used by Linux, macOS, Hadoop, HDFS, and kinit) stores credentials in a `flat, binary byte-stream file` 
+known as CCACHE (typically `version 0x0504`). You can find the origin doc [here](https://web.mit.edu/KERBEROS/krb5-1.22/doc/basic/ccache_def.html)
 
-### Top-level Structure
 
+The C implementation is in MIT krb5 source (`cc_file.c`), in Java `sun.security.krb5.internal.ccache.FileCredentialsCache`.
+
+Unlike KIRBI's variable-length tagged structure, CCACHE relies on strict field positioning using `big-endian (>) multi-byte integers`.
+
+### 2.1 Internal Binary Layout of CCACHE (v4)
+
+A standard CCACHE file is composed of a Header, a Primary Principal, and one or more Credential Records:
+
+```text
++-----------------------------------------------------------------------+
+|                              FILE HEADER                              |
++-----------------------------------------------------------------------+
+| Version (2 bytes)          | 0x0504 (KRB5_FCC_FVNO_4)                 |
+| Header Length (2 bytes)    | Size of header extension block            |
+| Header Tag & Data          | Optional context tags (e.g., KDC offsets) |
++-----------------------------------------------------------------------+
+|                           PRIMARY PRINCIPAL                           |
++-----------------------------------------------------------------------+
+| Name Type (4 bytes)        | e.g., 1 (KRB5_NT_PRINCIPAL)              |
+| Component Count (4 bytes)  | Number of sub-strings (e.g., 1 for "user")|
+| Realm Length + String      | 4-byte length + UTF-8 string              |
+| Component 1 Length + String| 4-byte length + UTF-8 string              |
++-----------------------------------------------------------------------+
+|                          CREDENTIAL RECORD 1                          |
++-----------------------------------------------------------------------+
+| Client Principal           | (Same Principal format as above)         |
+| Server Principal           | (Same Principal format as above)         |
+| Keyblock                   | Type (2B), AuthType (2B), Len (2B), Key  |
+| Times                      | authtime (4B), start (4B), end (4B), renew|
+| Is-Server-Key Flag         | 1 byte (0x00)                            |
+| Ticket Flags               | 4 bytes (Little-Endian integer!)          |
+| Addresses                  | Count (4B) + Address list                |
+| AuthData                   | Count (4B) + AuthData list               |
+| Ticket Length + Data       | 4-byte length + Raw Ticket Bytes         |
+| Second Ticket Length + Data| 4-byte length + Optional raw bytes        |
++-----------------------------------------------------------------------+
 ```
-[2 bytes]  file_format_version    always 0x0504 (== KRB5_FCC_FVNO_4)
-[2 bytes]  header_len             total bytes of tagged header fields
-[N bytes]  header_data            sequence of tag entries
-[principal] primary_principal     default client principal
-[credential] credential 0         first credential entry
-[credential] credential 1         ...
-...
-```
 
-All integer fields are **big-endian** (network byte order).
-
-### Header Tag Section
+### 2.2 FILE Header Section
 
 ```
 header_len (2 bytes) → value 12 for a single delta-time tag
@@ -113,22 +136,20 @@ header_len (2 bytes) → value 12 for a single delta-time tag
 
 The script writes a delta-time tag with both offsets set to 0.
 
-### Principal Encoding
+### 2.3 PRIMARY PRINCIPAL Section
 
-```
-name_type (4 bytes)   e.g. 1 = KRB5_NT_PRINCIPAL
-count     (4 bytes)   number of name components (NOT including realm)
-realm     (4-byte length + UTF-8 bytes)
-comp[0]   (4-byte length + UTF-8 bytes)
-comp[1]   (4-byte length + UTF-8 bytes)
-...
-```
 
-`count` = number of name-string components. The realm is written
-separately before the components. Java's `readPrincipal` reconstructs by
-reading `count + 1` strings (the first is the realm).
+- `Name Type (4 bytes)`:   e.g. 1 = KRB5_NT_PRINCIPAL 
+- `Component Count (4 bytes)`:   number of name components (NOT including realm)
+- `Realm (4-byte length + UTF-8 bytes)`: Realm of the KDC
+- `comp[0]   (4-byte length + UTF-8 bytes)`
+- `comp[1]   (4-byte length + UTF-8 bytes)`
+- ETC.
 
-### Credential Entry
+> `Component Count` = number of name-string components. The realm is written separately before the components. 
+> Java's `readPrincipal` reconstructs by reading `count + 1` strings (the first is the realm).
+
+### 2.4 Credential Entry
 
 ```
 client      principal
@@ -143,7 +164,7 @@ ticket      4-byte length + raw DER Ticket
 second_tkt  4-byte length + raw DER (empty for TGT/TGS)
 ```
 
-#### Keyblock
+#### 2.4.1 Keyblock
 
 ```
 keytype (2 bytes, signed big-endian)   e.g. 18 = AES256
@@ -158,7 +179,7 @@ reads `readLength4()` = 4 bytes, so the combined `[0, 0, len_hi, len_lo]`
 resolves to the correct key length. This is compatible as long as keys are
 < 65536 bytes (always true for Kerberos).
 
-#### Ticket Flags
+#### 2.4.2 Ticket Flags
 
 The script writes flags in **little-endian** byte order to match
 minikerberos's convention. Java reads flags as big-endian, so the bit
@@ -166,7 +187,7 @@ positions will be scrambled. This does not cause an `EOFException` but
 flag semantics will be lost in Java. MIT krb5's `klist` shows correct
 flags on little-endian hosts.
 
-#### Times
+#### 2.4.3 Times
 
 Four consecutive Unix timestamps (`authtime`, `starttime`, `endtime`,
 `renew_till`), each a big-endian unsigned 32-bit integer representing
@@ -176,24 +197,26 @@ seconds since 1970-01-01 UTC. Zero means "not set."
 
 ## Conversion Walkthrough
 
-```
+The below figure shows the field correspondance between kirbi and CCache file.
+
+```text
 kirbi file                  ccache file
-┌──────────────────┐        ┌──────────────────────┐
+┌──────────────────┐         ┌───────────────────────┐
 │  [APP 22] SEQUENCE│        │  version (0x0504)     │
 │    pvno           │────┐   │  header               │
 │    msg-type       │    │   │  primary_principal    │← client from krbcredinfo.pname
-│    tickets[0]     │──┐ │   ├──────────────────────┤
-│      Ticket DER   │←┼─┼─┐ │  client principal     │← krbcredinfo.pname + prealm
+│    tickets[0]     │──┐ │   ├───────────────────────┤
+│      Ticket DER   │ ←┼─┼─┐ │  client principal     │← krbcredinfo.pname + prealm
 │    enc-part       │  │ │ │ │  server principal     │← krbcredinfo.sname + srealm
 │      etype = 0    │  │ │ │ │  keyblock             │← krbcredinfo.key
 │      cipher       │  │ │ │ │  times                │← krbcredinfo.authtime..renew-till
-│        EncKrbCred │  │ │ │ │  is_skey = 0         │
+│        EncKrbCred │  │ │ │ │  is_skey = 0          │
 │          ticket-  │  │ │ │ │  flags                │← krbcredinfo.flags
-│          info[0]  │  │ │ │ │  num_address = 0     │
-│            key    │──┘ │ │ │  num_authdata = 0    │
+│          info[0]  │  │ │ │ │  num_address = 0      │
+│            key    │──┘ │ │ │  num_authdata = 0     │
 │            prealm │────┘ │ │  ticket               │← tickets[0] raw DER
 │            pname  │──────┘ │  second_ticket (empty)│
-│            flags  │────────┘ └──────────────────────┘
+│            flags  │────────┘ └─────────────────────┘
 │            ...
 └──────────────────┘
 ```
@@ -274,3 +297,17 @@ info = {
   - `CCacheInputStream.java`
   - `FileCCacheConstants.java` (`KRB5_FCC_FVNO_4 = 0x504`)
 - Mimikatz / Rubeus: kirbi = DER-encoded KRB-CRED
+
+
+## Overview
+
+`kirbi2ccache.py` is a zero-dependency Python script that converts Kerberos
+credential files from **kirbi format** (Mimikatz/Rubeus) to **MIT ccache
+format** (the standard credential cache used by MIT krb5, Java's
+`sun.security.krb5`, and tools like `klist`).
+
+```bash
+python kirbi2ccache.py ticket.kirbi          # → ticket.ccache
+python kirbi2ccache.py ticket.kirbi out.bin   # → out.bin
+python kirbi2ccache.py base64.kirbi           # Rubeus base64 input
+```
