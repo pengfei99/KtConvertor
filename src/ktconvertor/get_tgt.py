@@ -11,15 +11,13 @@ Dependencies:
 """
 import base64
 import os
-import sys
-import ctypes
 import ctypes.wintypes
 from ctypes import (
     Structure, POINTER, byref, pointer, cast, addressof,
-    c_void_p, c_uint32, c_int32, c_ushort, c_char, c_byte,
-    c_ulong, c_long, create_string_buffer, sizeof, string_at, WinError,
+    c_void_p, c_ushort, c_char, c_byte,
+    c_ulong, create_string_buffer, sizeof, string_at, WinError,
 )
-from ctypes.wintypes import HANDLE, DWORD, LONG, WORD
+from ctypes.wintypes import HANDLE, LONG
 
 from asn1crypto import core
 from minikerberos.protocol.asn1_structs import AP_REQ, KRB_CRED, EncryptedData, Authenticator, EncKrbCredPart

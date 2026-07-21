@@ -12,7 +12,12 @@ license = { text = "MIT" }
 
 keywords = ["kerberos", "ccache", ]
 
-dependencies = ["pyasn1", "minikerberos","asn1crypto", "typer"
+dependencies = [
+    "pyasn1",
+    "minikerberos",
+    "asn1crypto",
+    "typer",
+    "unicrypto>=0.0.12",
 ]
 
 [project.optional-dependencies]
