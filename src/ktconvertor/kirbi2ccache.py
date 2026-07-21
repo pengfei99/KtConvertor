@@ -64,6 +64,7 @@ class TLV:
         # for example
         # Original Byte:   1 0 0 0 0 0 0 0  (Binary for 0x80)
         # Shift right 6:   0 0 0 0 0 0 1 0  (Shifted 6 positions to the right)
+
         # Result Decimal:  2                (Context-specific class)
         self.tag_class: ASN1Class = ASN1Class((tag & self.CLASS_MASK) >> 6)
         self.constructed: bool = bool(tag & self.CONSTRUCTED_MASK)
@@ -232,38 +233,38 @@ def parse_krbcredinfo(seq_tlv: TLV) -> KrbCredInfo:
             inner = unwrap_prim(c)
             if inner:
                 info['prealm'] = inner.value
-            elif c.tag_num == 2 and c.tag_class == 2:  # pname
-                inner_seq = unwrap_seq(c)
-                if inner_seq:
-                    info['pname'] = parse_principal(inner_seq)
-            elif c.tag_num == 3 and c.tag_class == 2:  # flags
-                inner = unwrap_prim(c)
-                if inner:
-                    info['flags'] = inner.value
-            elif c.tag_num == 4 and c.tag_class == 2:  # authtime
-                inner = unwrap_prim(c)
-                if inner:
-                    info['authtime'] = parse_kerberostime(inner.value)
-            elif c.tag_num == 5 and c.tag_class == 2:  # starttime
-                inner = unwrap_prim(c)
-                if inner:
-                    info['starttime'] = parse_kerberostime(inner.value)
-            elif c.tag_num == 6 and c.tag_class == 2:  # endtime
-                inner = unwrap_prim(c)
-                if inner:
-                    info['endtime'] = parse_kerberostime(inner.value)
-            elif c.tag_num == 7 and c.tag_class == 2:  # renew_till
-                inner = unwrap_prim(c)
-                if inner:
-                    info['renew_till'] = parse_kerberostime(inner.value)
-            elif c.tag_num == 8 and c.tag_class == 2:  # srealm
-                inner = unwrap_prim(c)
-                if inner:
-                    info['srealm'] = inner.value
-            elif c.tag_num == 9 and c.tag_class == 2:  # sname
-                inner_seq = unwrap_seq(c)
-                if inner_seq:
-                    info['sname'] = parse_principal(inner_seq)
+        elif c.tag_num == 2 and c.tag_class == 2:  # pname
+            inner_seq = unwrap_seq(c)
+            if inner_seq:
+                info['pname'] = parse_principal(inner_seq)
+        elif c.tag_num == 3 and c.tag_class == 2:  # flags
+            inner = unwrap_prim(c)
+            if inner:
+                info['flags'] = inner.value
+        elif c.tag_num == 4 and c.tag_class == 2:  # authtime
+            inner = unwrap_prim(c)
+            if inner:
+                info['authtime'] = parse_kerberostime(inner.value)
+        elif c.tag_num == 5 and c.tag_class == 2:  # starttime
+            inner = unwrap_prim(c)
+            if inner:
+                info['starttime'] = parse_kerberostime(inner.value)
+        elif c.tag_num == 6 and c.tag_class == 2:  # endtime
+            inner = unwrap_prim(c)
+            if inner:
+                info['endtime'] = parse_kerberostime(inner.value)
+        elif c.tag_num == 7 and c.tag_class == 2:  # renew_till
+            inner = unwrap_prim(c)
+            if inner:
+                info['renew_till'] = parse_kerberostime(inner.value)
+        elif c.tag_num == 8 and c.tag_class == 2:  # srealm
+            inner = unwrap_prim(c)
+            if inner:
+                info['srealm'] = inner.value
+        elif c.tag_num == 9 and c.tag_class == 2:  # sname
+            inner_seq = unwrap_seq(c)
+            if inner_seq:
+                info['sname'] = parse_principal(inner_seq)
     return info
 
 
