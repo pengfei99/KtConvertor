@@ -201,7 +201,7 @@ The below figure shows the field correspondance between kirbi and CCache file.
 
 ```text
 kirbi file                  ccache file
-┌──────────────────┐         ┌───────────────────────┐
+┌───────────────────┐        ┌───────────────────────┐
 │  [APP 22] SEQUENCE│        │  version (0x0504)     │
 │    pvno           │────┐   │  header               │
 │    msg-type       │    │   │  primary_principal    │← client from krbcredinfo.pname
@@ -218,7 +218,7 @@ kirbi file                  ccache file
 │            pname  │──────┘ │  second_ticket (empty)│
 │            flags  │────────┘ └─────────────────────┘
 │            ...
-└──────────────────┘
+└───────────────────┘
 ```
 
 ### Step-by-step in `kirbi_to_ccache()`
