@@ -64,7 +64,6 @@ class TLV:
         # for example
         # Original Byte:   1 0 0 0 0 0 0 0  (Binary for 0x80)
         # Shift right 6:   0 0 0 0 0 0 1 0  (Shifted 6 positions to the right)
-
         # Result Decimal:  2                (Context-specific class)
         self.tag_class: ASN1Class = ASN1Class((tag & self.CLASS_MASK) >> 6)
         self.constructed: bool = bool(tag & self.CONSTRUCTED_MASK)
