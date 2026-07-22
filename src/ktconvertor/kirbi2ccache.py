@@ -442,5 +442,4 @@ if __name__ == '__main__':
 """
 test command
 uv run kirbi2ccache.py "C:/Users/pliu/Documents/git/KtConvertor/tests/tmp/tgt.kirbi"  "C:/Users/pliu/Documents/git/KtConvertor/tests/tmp/krb5cc_1000"
-
 """

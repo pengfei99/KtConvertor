@@ -11,7 +11,6 @@ Dependencies:
 """
 # this tells Python to store type hints as unevaluated strings at definition time, completely solving forward reference issues.
 from __future__ import annotations
-import base64
 import os
 # Imports Python's pre-defined C-compatible Windows API types (such as DWORD, HANDLE, BOOL).
 import ctypes.wintypes
@@ -38,9 +37,11 @@ from enum import IntEnum
 from typing import TypedDict, Tuple
 
 from asn1crypto import core
-from minikerberos.protocol.asn1_structs import AP_REQ, KRB_CRED, EncryptedData, Authenticator, EncKrbCredPart
+from minikerberos.protocol.asn1_structs import AP_REQ, KRB_CRED, EncryptedData, Authenticator
 from minikerberos.protocol.encryption import Key, _enctype_table
 from minikerberos.protocol.structures import AuthenticatorChecksum, ChecksumFlags
+
+from ktconvertor.kirbi2ccache import kirbi_to_ccache
 
 # Platform Guard: Ensure ctypes Windows definitions fail fast on non-Windows environments
 if sys.platform != "win32":
@@ -665,146 +666,78 @@ class InitialContextToken(core.Sequence):
 #  Main
 # ============================================================
 
-def get_tgt(target=None):
+def get_tgt(target=None) -> bytes:
     """
-    Returns the TGT as a KRB_CRED (kirbi) bytes object.
+    Retrieve the Kerberos Ticket Granting Ticket (TGT) via SSPI credential delegation.
+
+    Requests an AP-REQ token from SSPI with delegation enabled (`ISC_REQ_DELEGATE`),
+    extracts the target session key via LSA, decrypts the GSS-API authenticator
+    checksum payload, and returns the resulting `KRB_CRED` (kirbi) structure.
+    :param target: Target Service Principal Name (SPN), e.g., 'cifs/dc01.domain.local'.
+            If None, defaults to 'cifs/<LOGONSERVER>' using the system environment variable.
+    :return: Raw BER-encoded `KRB_CRED` (kirbi) binary data.
     """
 
-    # --- default target ---
+    # 1. Resolve target SPN
+    # todo not validation on the logonserver, if user enters a bad server name, the program will crash
     if target is None:
-        ls = os.environ.get("LOGONSERVER", "").lstrip("\\")
-        if not ls:
-            raise RuntimeError("No --target and LOGONSERVER not set.")
-        target = f"cifs/{ls}"
+        logon_server = os.environ.get("LOGONSERVER", "").lstrip("\\")
+        if not logon_server:
+            raise RuntimeError(
+                "Target SPN not provided and environment variable 'LOGONSERVER' is not set."
+            )
+        target = f"cifs/{logon_server}"
 
-    # --- LSA kerberos package ID ---
-    lsa = LsaConnectUntrusted()
+    # 2. Retrieve Kerberos Authentication Package ID
+    lsa_handle = LsaConnectUntrusted()
     try:
-        pkg_id = LsaLookupAuthenticationPackage(lsa, "kerberos")
+        pkg_id = LsaLookupAuthenticationPackage(lsa_handle, "kerberos")
     finally:
-        LsaDeregisterLogonProcess(lsa)
+        LsaDeregisterLogonProcess(lsa_handle)
 
-    # --- SSPI: get AP-REQ w/ delegation ---
+    # 3. Request AP-REQ via SSPI with delegation enabled
     creds = AcquireCredentialsHandle("kerberos", SECPKG_CRED_OUTBOUND)
     flags = ISC_REQ_DELEGATE | ISC_REQ_MUTUAL_AUTH | ISC_REQ_ALLOCATE_MEMORY
     res, ctx, bufs = InitializeSecurityContext(creds, target, flags)
 
     if res not in (SEC_E_OK, SEC_E_CONTINUE_NEEDED):
-        raise RuntimeError(f"InitializeSecurityContext failed: {res:#x}")
+        raise RuntimeError(f"InitializeSecurityContext failed with status code: {res:#x}")
 
-    raw_token = bufs[0][1]  # ASN1 InitialContextToken containing AP-REQ
+    # Extract AP-REQ ASN.1 InitialContextToken byte payload
+    raw_token: bytes = bufs[0][1]
 
-    # --- session key via LSA ---
-    lsa2 = LsaConnectUntrusted()
+    # 4. Extract target Kerberos session key via LSA
+    lsa_handle_2 = LsaConnectUntrusted()
     try:
-        raw_ticket = extract_ticket(lsa2, pkg_id, 0, target)
+        raw_ticket = extract_ticket(lsa_handle_2, pkg_id, 0, target)
     finally:
-        LsaDeregisterLogonProcess(lsa2)
+        LsaDeregisterLogonProcess(lsa_handle_2)
 
-    key = Key(raw_ticket["Key"]["KeyType"], raw_ticket["Key"]["Key"])
+    session_key_meta = raw_ticket["Key"]
+    key = Key(session_key_meta["KeyType"], session_key_meta["Key"])
 
-    # --- parse AP-REQ ---
+    # 5. Parse AP-REQ and decrypt Authenticator
     ict = InitialContextToken.load(raw_token)
     apreq = AP_REQ(ict.native["innerContextToken"]).native
 
-    # --- decrypt authenticator ---
     cipher = _enctype_table[apreq["authenticator"]["etype"]]
+    # Key Usage 11 = KRB_KEY_USAGE_AP_REQ_AUTH (RFC 4120 §7.5.8)
     auth_plain = cipher.decrypt(key, 11, apreq["authenticator"]["cipher"])
     authenticator = Authenticator.load(auth_plain).native
 
-    # --- delegation checksum ---
+    # 6. Validate GSS-API delegation checksum (0x8003)
     ck = authenticator["cksum"]
     if ck["cksumtype"] != 0x8003:
-        raise RuntimeError(f"Unexpected checksum type: {ck['cksumtype']:#x}")
+        raise RuntimeError(f"Unexpected checksum type: {ck['cksumtype']:#x} (expected 0x8003)")
 
     cdata = AuthenticatorChecksum.from_bytes(ck["checksum"])
     if ChecksumFlags.GSS_C_DELEG_FLAG not in cdata.flags:
-        raise RuntimeError("GSS_C_DELEG_FLAG not set -- no delegated TGT")
+        raise RuntimeError("GSS_C_DELEG_FLAG missing — SSPI failed to delegate TGT.")
 
-    # --- decrypt KRB_CRED ---
+    # 7. Decrypt KRB_CRED inner payload
     cred_native = KRB_CRED.load(cdata.delegation_data).native
+    # Key Usage 14 = KRB_KEY_USAGE_KRB_CRED_PART (RFC 4120 §7.5.8)
     cred_plain = cipher.decrypt(key, 14, cred_native["enc-part"]["cipher"])
 
     cred_native["enc-part"] = EncryptedData({"etype": 0, "cipher": cred_plain})
     return KRB_CRED(cred_native).dump()
-
-
-# ============================================================
-#  CLI
-# ============================================================
-
-def _print_ticket_info(raw_ticket):
-    from minikerberos.protocol.asn1_structs import KRB_CRED as _KC
-    tkt = _KC.load(raw_ticket["Ticket"]).native
-    realm = (
-        tkt.get("realm", b"").decode() if isinstance(tkt.get("realm"), bytes)
-        else str(tkt.get("realm", ""))
-    )
-    sname = tkt.get("sname", {})
-    parts = [s.decode() if isinstance(s, bytes) else str(s) for s in sname.get("name-string", [])]
-    print(f"[+] Ticket for: {'/'.join(parts)}@{realm}")
-    print(f"[+] Session key: {raw_ticket['Key']['KeyType']} / {raw_ticket['Key']['Key'].hex()[:16]}...")
-
-
-def main():
-    import argparse
-    ap = argparse.ArgumentParser(description="Extract current user's Kerberos TGT")
-    ap.add_argument("--target", help="SPN (default: cifs\\<LOGONSERVER>)")
-    ap.add_argument("-o", "--out-file", help="Save TGT as kirbi file")
-    ap.add_argument("-v", "--verbose", action="store_true", help="Show ticket metadata")
-    args = ap.parse_args()
-
-    raw_ticket = []
-
-    def _cb(t):
-        raw_ticket.append(t)
-
-    kirbi = get_tgt(args.target)
-
-    # Re-fetch metadata for verbose (cheap since cached in LSA)
-    if args.verbose:
-        lsa = LsaConnectUntrusted()
-        try:
-            pkg_id = LsaLookupAuthenticationPackage(lsa, "kerberos")
-            t = extract_ticket(lsa, pkg_id, 0, args.target or os.environ.get("LOGONSERVER", "").lstrip("\\"))
-            _print_ticket_info(t)
-        finally:
-            LsaDeregisterLogonProcess(lsa)
-
-    if args.out_file:
-        with open(args.out_file, "wb") as f:
-            f.write(kirbi)
-        print(f"[+] Wrote TGT ({len(kirbi)} bytes) to {args.out_file}")
-        return
-
-    # Print details to stdout
-    from minikerberos.protocol.asn1_structs import KRB_CRED
-    k = KRB_CRED.load(kirbi).native
-    for ticket in k.get("tickets", []):
-        realm = ticket.get("realm", b"").decode() if isinstance(ticket.get("realm"), bytes) else str(
-            ticket.get("realm", ""))
-        sname = ticket.get("sname", {})
-        parts = [s.decode() if isinstance(s, bytes) else str(s) for s in sname.get("name-string", [])]
-        print(f"  SPN:    {'/'.join(parts)}")
-        print(f"  Realm:  {realm}")
-
-    if k.get("enc-part", {}).get("etype") == 0:
-        cred = EncKrbCredPart.load(k["enc-part"]["cipher"]).native
-        for info in cred.get("ticket-info", []):
-            key = info.get("key", {})
-            keytype = key.get("keytype", "?")
-            keyvalue = base64.b64encode(key.get("keyvalue", b"")).decode()
-            flags = info.get("flags", [])
-            print(f"  Client:   {'/'.join(info.get('pname', {}).get('name-string', []))}")
-            print(f"  Realm:    {info.get('prealm', '')}")
-            print(f"  Start:    {info.get('starttime', '?')}")
-            print(f"  End:      {info.get('endtime', '?')}")
-            print(f"  Renew:    {info.get('renew-till', '?')}")
-            print(f"  Flags:    {', '.join(flags) if flags else '?'}")
-            print(f"  KeyType:  {keytype}")
-            print(f"  Key:      {keyvalue}")
-    print(f"  KirbiB64: {base64.b64encode(kirbi).decode()}")
-
-
-if __name__ == "__main__":
-    main()
