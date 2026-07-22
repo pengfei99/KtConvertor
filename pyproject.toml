@@ -1,7 +1,7 @@
 [project]
 name = "ktconvertor"
 version = "0.3.0"
-description = "This tool can convert kerberos ticket of format .kirbi to standard MIT CCACHE format"
+description = "This tool fetch a kerberos TGT ticket of the current user in raw kirbi bytes, and convert kerberos ticket of format .kirbi to standard MIT CCACHE format"
 readme = "README.md"
 requires-python = ">=3.11"
 
@@ -13,7 +13,6 @@ license = { text = "MIT" }
 keywords = ["kerberos", "ccache", ]
 
 dependencies = [
-    "pyasn1",
     "minikerberos",
     "asn1crypto",
     "typer",
