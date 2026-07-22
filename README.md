@@ -1,11 +1,17 @@
 # KtConvertor
 
-The objective of this project is to convert a kerberos ticket from format `.kirbi` to MIT Kerberos cache file. 
+The objective of this project is to get a TGT from a windows logon session, then convert a kerberos ticket from 
+format `.kirbi` to MIT Kerberos cache file. 
 
-There exist tools such as [impacket](https://github.com/fortra/impacket) which can do the same thing. Why I do this?
-Because `impacket` is considered as a virus by `Windows defender`.
 
-We use the `ccache.py` of the project [minikerberos](https://github.com/skelsec/minikerberos/blob/main/minikerberos/common/ccache.py)
+## Existing tools
+
+There are existing tools:
+- https://github.com/ParrotSec/mimikatz: a tool in C to test Windows security.
+- https://github.com/skelsec/pypykatz: Mimikatz implementation in pure Python
+- https://github.com/ghostpack/rubeus: C# toolset for raw Kerberos interaction
+- https://github.com/skelsec/minikerberos: python implementation for kerberos ticket management
+- https://github.com/fortra/impacket: python implementation for kerberos ticket management `impacket` is considered as a virus by `Windows defender`
 
 
 ## 🚀 Key Features

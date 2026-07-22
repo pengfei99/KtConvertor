@@ -9,24 +9,44 @@ Usage:
 Dependencies:
     pip install minikerberos asn1crypto
 """
+# this tells Python to store type hints as unevaluated strings at definition time, completely solving forward reference issues.
+from __future__ import annotations
 import base64
 import os
+# Imports Python's pre-defined C-compatible Windows API types (such as DWORD, HANDLE, BOOL).
 import ctypes.wintypes
+import sys
+# Structure: Base class for defining C-style struct memory layouts in Python.
+# POINTER: Factory function to create pointer types (equivalent to T* in C).
+# byref: Creates a lightweight pointer reference to pass ctypes objects to C functions efficiently without full pointer instantiation.
+# pointer: Instantiates a full ctypes pointer object.
+# cast: Casts raw ctypes pointers or memory addresses to different type pointers (like (void*) in C).
+# addressof: Returns the memory address of a ctypes object as an integer.
+# c_void_p, c_ushort, c_char, c_byte, c_ulong: C-compatible primitive data types representing void*, unsigned short, char, unsigned char/byte, and unsigned long.
+# create_string_buffer: Allocates a mutable block of memory (a byte buffer).
+# sizeof: Calculates the byte size of a ctypes data type or structure in memory.
+# string_at: Reads a specified number of raw bytes from a target memory address.
+# WinError: Converts Windows OS error codes into Python-native OSError exceptions.
 from ctypes import (
     Structure, POINTER, byref, pointer, cast, addressof,
     c_void_p, c_ushort, c_char, c_byte,
     c_ulong, create_string_buffer, sizeof, string_at, WinError,
 )
+# HANDLE, LONG: Windows-specific type abstractions for system handles (void*) and signed 32-bit integers (long).
 from ctypes.wintypes import HANDLE, LONG
+from typing import TypedDict
 
 from asn1crypto import core
 from minikerberos.protocol.asn1_structs import AP_REQ, KRB_CRED, EncryptedData, Authenticator, EncKrbCredPart
 from minikerberos.protocol.encryption import Key, _enctype_table
 from minikerberos.protocol.structures import AuthenticatorChecksum, ChecksumFlags
 
+# Platform Guard: Ensure ctypes Windows definitions fail fast on non-Windows environments
+if sys.platform != "win32":
+    raise ImportError("This tool is designed for Windows only.")
 
 # ============================================================
-#  Type aliases
+#  These lines establish C-style naming conventions mirroring standard Windows SDK headers
 # ============================================================
 PVOID = c_void_p
 PPVOID = POINTER(PVOID)
@@ -44,41 +64,139 @@ USHORT = c_ushort
 # ============================================================
 
 class LUID(Structure):
-    _fields_ = [("LowPart", ULONG), ("HighPart", LONG)]
-    def to_int(self):
-        return (self.HighPart << 32) + self.LowPart
-    @staticmethod
-    def from_int(i):
-        l = LUID(); l.HighPart = i >> 32; l.LowPart = i & 0xFFFFFFFF; return l
+    """
+    Defines a standard Windows Locally Unique Identifier structure.
+    """
+    _fields_ = [
+        ("LowPart", ULONG),
+        ("HighPart", LONG)
+    ]
 
+    def to_int(self) -> int:
+        """Combine HighPart and LowPart into a single 64-bit integer."""
+        return (self.HighPart << 32) + self.LowPart
+
+    @staticmethod
+    def from_int(i: int) -> LUID:
+        """
+        Factory method to construct an LUID instance from a 64-bit integer.
+        :param i:
+        :return:
+        """
+        l = LUID()
+        l.HighPart = i >> 32
+        l.LowPart = i & 0xFFFFFFFF
+        return l
+
+
+# creates a module-level alias for a C pointer type that points to an LUID structure.
 PLUID = POINTER(LUID)
 
+# In the Windows SDK (ntdef.h), Microsoft defines LSA_STRING (and its alias STRING) to represent length-prefixed
+# ANSI/ASCII byte buffers used by Local Security Authority (LSA) APIs:
+"""
+typedef struct _STRING {
+    USHORT Length;
+    USHORT MaximumLength;
+    PCHAR  Buffer;
+} STRING, *PSTRING, LSA_STRING, *PLSA_STRING;
+"""
 
-class LSA_STRING(Structure):
+
+class LsaString(Structure):
+    """
+    It defines a C-compatible memory layout for the Windows LSA_STRING structure using Python's ctypes module
+    Length:	USHORT (16-bit), The actual byte count of the data stored in Buffer (excluding any trailing null character).
+    MaximumLength: USHORT (16-bit), The total memory allocated for Buffer in bytes.
+    Buffer: POINTER(c_char), A pointer to a C character array (char*) holding the raw bytes in memory.
+    """
     _fields_ = [("Length", USHORT), ("MaximumLength", USHORT), ("Buffer", POINTER(c_char))]
 
-PLSA_STRING = POINTER(LSA_STRING)
+
+# creates a module-level alias for a C pointer type that points to a LsaString.
+PLsaString = POINTER(LsaString)
 
 
-class LSA_UNICODE_STRING(Structure):
+class LsaUnicodeString(Structure):
+    """
+    Represents the native Windows LSA_UNICODE_STRING / UNICODE_STRING structure.
+
+        In the Windows API, UNICODE_STRING manages length-prefixed UTF-16-LE strings.
+        Crucially, both `Length` and `MaximumLength` are measured in **bytes**,
+        not character counts.
+    """
     _fields_ = [("Length", USHORT), ("MaximumLength", USHORT), ("Buffer", POINTER(c_char))]
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Anchor underlying buffer memory to prevent Python's Garbage Collector
+        # from freeing the C memory while Windows native APIs hold the pointer.
+        self._keep_alive: ctypes.Array[c_char] | None = None
+
     @staticmethod
-    def from_string(s):
+    def from_string(s: str):
+        """
+        Factory method to construct an LsaUnicodeString from a Python string.
+        :param s: The Python string to convert into a UTF-16-LE byte buffer.
+        :return: An instance of LsaUnicodeString containing a pointer to the UTF-16-LE encoded buffer.
+        """
+        # Encode string to UTF-16-LE (without byte order mark)
         enc = s.encode("utf-16-le")
-        lus = LSA_UNICODE_STRING()
+        lus = LsaUnicodeString()
         buf = create_string_buffer(enc, len(enc))
         lus.Buffer = cast(buf, POINTER(c_char))
         lus.MaximumLength = len(enc) + 1
+        # 'Length' is byte count EXCLUDING the null terminator
         lus.Length = len(enc)
         return lus
+
     def to_string(self):
+        """
+        Decode the underlying UTF-16-LE C buffer into a native Python string.
+        :return: The decoded string, or an empty string if the Buffer is NULL or Length is 0.
+        """
         return string_at(self.Buffer, self.MaximumLength).decode("utf-16-le", errors="replace").rstrip("\x00")
 
 
-class KERB_CRYPTO_KEY(Structure):
-    _fields_ = [("KeyType", LONG), ("Length", ULONG), ("Value", PVOID)]
-    def to_dict(self):
-        return {"KeyType": self.KeyType, "Key": string_at(self.Value, self.Length)}
+class KerbCryptoKeyDict(TypedDict):
+    """Type definition for the dictionary representation of a KerbCryptoKey."""
+    KeyType: int
+    Key: bytes
+
+
+class KerbCryptoKey(Structure):
+    """
+    Represents the native Windows KERB_CRYPTO_KEY structure (ntsecapi.h).
+
+    Used by Local Security Authority (LSA) APIs to return cryptographic key material
+    (such as Kerberos session keys) along with their encryption algorithm ID (etype).
+    """
+    _fields_ = [
+        ("KeyType", LONG),
+        ("Length", ULONG),
+        ("Value", PVOID)
+    ]
+
+    @property
+    def key_bytes(self) -> bytes:
+        """
+        Safely extract raw cryptographic key bytes from the Value pointer.
+        :return: Raw binary key material, or b"" if Value is NULL or Length is 0.
+        """
+        # Guard against NULL pointer dereferences or zero-length allocations
+        if not self.Value or self.Length == 0:
+            return b""
+        return string_at(self.Value, self.Length)
+
+    def to_dict(self) -> KerbCryptoKeyDict:
+        """
+        Export key metadata and raw key material to a typed dictionary.
+        :return: KerbCryptoKeyDict: A dictionary containing 'KeyType' (int) and 'Key' (bytes).
+        """
+        return {
+            "KeyType": int(self.KeyType),
+            "Key": self.key_bytes,
+        }
 
 
 class KERB_EXTERNAL_TICKET(Structure):
@@ -86,10 +204,10 @@ class KERB_EXTERNAL_TICKET(Structure):
         ("ServiceName", PVOID),
         ("TargetName", PVOID),
         ("ClientName", PVOID),
-        ("DomainName", LSA_UNICODE_STRING),
-        ("TargetDomainName", LSA_UNICODE_STRING),
-        ("AltTargetDomainName", LSA_UNICODE_STRING),
-        ("SessionKey", KERB_CRYPTO_KEY),
+        ("DomainName", LsaUnicodeString),
+        ("TargetDomainName", LsaUnicodeString),
+        ("AltTargetDomainName", LsaUnicodeString),
+        ("SessionKey", KerbCryptoKey),
         ("TicketFlags", ULONG),
         ("Flags", ULONG),
         ("KeyExpirationTime", LARGE_INTEGER),
@@ -100,6 +218,7 @@ class KERB_EXTERNAL_TICKET(Structure):
         ("EncodedTicketSize", ULONG),
         ("EncodedTicket", PVOID),
     ]
+
     def get_data(self):
         return {"Key": self.SessionKey.to_dict(), "Ticket": string_at(self.EncodedTicket, self.EncodedTicketSize)}
 
@@ -114,8 +233,10 @@ class KERB_RETRIEVE_TKT_RESPONSE(Structure):
 
 class SecHandle(Structure):
     _fields_ = [("dwLower", POINTER(ULONG)), ("dwUpper", POINTER(ULONG))]
+
     def __init__(self):
         super().__init__(pointer(ULONG()), pointer(ULONG()))
+
 
 CredHandle = SecHandle
 PCredHandle = POINTER(CredHandle)
@@ -126,16 +247,19 @@ PCtxtHandle = POINTER(CtxtHandle)
 class TimeStamp(Structure):
     _fields_ = [("dwLowDateTime", ULONG), ("dwHighDateTime", ULONG)]
 
+
 PTimeStamp = POINTER(TimeStamp)
 
 
 class SecBuffer(Structure):
     _fields_ = [("cbBuffer", ULONG), ("BufferType", ULONG), ("pvBuffer", PVOID)]
+
     def __init__(self, token=None, buffer_type=2):
         if token is None:
             token = b"\x00" * 2880
         self._buf = create_string_buffer(token, len(token))  # keep ref alive!
         super().__init__(sizeof(self._buf), buffer_type, cast(self._buf, PVOID))
+
     @property
     def Buffer(self):
         return (self.BufferType, string_at(self.pvBuffer, self.cbBuffer))
@@ -143,6 +267,7 @@ class SecBuffer(Structure):
 
 class SecBufferDesc(Structure):
     _fields_ = [("ulVersion", ULONG), ("cBuffers", ULONG), ("pBuffers", POINTER(SecBuffer))]
+
     def __init__(self, sb=None):
         if sb is not None:
             # keep elements alive via a slice copy
@@ -152,12 +277,13 @@ class SecBufferDesc(Structure):
         else:
             self._buf = SecBuffer()
             super().__init__(0, 1, pointer(self._buf))
+
     @property
     def Buffers(self):
         return [self.pBuffers[i].Buffer for i in range(self.cBuffers)]
 
-PSecBufferDesc = POINTER(SecBufferDesc)
 
+PSecBufferDesc = POINTER(SecBufferDesc)
 
 # ============================================================
 #  Constants
@@ -173,12 +299,16 @@ ISC_REQ_DELEGATE = 0x00000001
 ISC_REQ_MUTUAL_AUTH = 0x00000002
 ISC_REQ_ALLOCATE_MEMORY = 0x00000100
 
-
 # ============================================================
 #  WinAPI — LSA
 # ============================================================
 
+# dynamically loads Windows' native Secur32.dll system library into Python's process memory space.
+#
+# This line grants Python direct access to lower-level Windows Security APIs, such as the SSPI (Security Support Provider Interface)
+# and LSA (Local Security Authority) functions.
 secur32 = ctypes.windll.Secur32
+
 
 def _check_nt(result, func, args):
     if result != 0:
@@ -188,7 +318,9 @@ def _check_nt(result, func, args):
 
 def LsaConnectUntrusted():
     f = secur32.LsaConnectUntrusted
-    f.argtypes = [PHANDLE]; f.restype = NTSTATUS; f.errcheck = _check_nt
+    f.argtypes = [PHANDLE]
+    f.restype = NTSTATUS
+    f.errcheck = _check_nt
     h = HANDLE(-1)
     f(byref(h))
     return h
@@ -196,23 +328,31 @@ def LsaConnectUntrusted():
 
 def LsaDeregisterLogonProcess(h):
     f = secur32.LsaDeregisterLogonProcess
-    f.argtypes = [HANDLE]; f.restype = NTSTATUS; f.errcheck = _check_nt
+    f.argtypes = [HANDLE]
+    f.restype = NTSTATUS
+    f.errcheck = _check_nt
     f(h)
 
 
 def LsaFreeReturnBuffer(p):
     f = secur32.LsaFreeReturnBuffer
-    f.argtypes = [PVOID]; f.restype = NTSTATUS; f.errcheck = _check_nt
+    f.argtypes = [PVOID]
+    f.restype = NTSTATUS
+    f.errcheck = _check_nt
     f(p)
 
 
 def LsaLookupAuthenticationPackage(h, pkg):
     f = secur32.LsaLookupAuthenticationPackage
-    f.argtypes = [HANDLE, PLSA_STRING, PULONG]
-    f.restype = NTSTATUS; f.errcheck = _check_nt
+    f.argtypes = [HANDLE, PLsaString, PULONG]
+    f.restype = NTSTATUS
+    f.errcheck = _check_nt
 
     b = pkg.encode() if isinstance(pkg, str) else pkg
-    s = LSA_STRING(); s.Buffer = create_string_buffer(b); s.Length = len(b); s.MaximumLength = len(b) + 1
+    s = LsaString()
+    s.Buffer = create_string_buffer(b)
+    s.Length = len(b)
+    s.MaximumLength = len(b) + 1
     pid = ULONG(0)
     f(h, byref(s), byref(pid))
     return pid.value
@@ -225,11 +365,14 @@ def LsaCallAuthenticationPackage(lsa_handle, pkg_id, msg):
     """
     f = secur32.LsaCallAuthenticationPackage
     f.argtypes = [HANDLE, ULONG, PVOID, ULONG, PPVOID, PULONG, PNTSTATUS]
-    f.restype = ULONG; f.errcheck = _check_nt
+    f.restype = ULONG
+    f.errcheck = _check_nt
 
     msg_len = sizeof(msg) if isinstance(msg, Structure) else len(msg) if isinstance(msg, bytes) else 0
 
-    ret_p = PVOID(); ret_len = ULONG(0); ret_st = LONG(-1)
+    ret_p = PVOID()
+    ret_len = ULONG(0)
+    ret_st = LONG(-1)
     f(lsa_handle, pkg_id, byref(msg), msg_len, byref(ret_p), byref(ret_len), byref(ret_st))
 
     if ret_st.value != 0:
@@ -253,10 +396,12 @@ def _check_sec(result, func, args):
 def AcquireCredentialsHandle(pkg_name, cred_usage):
     f = secur32.AcquireCredentialsHandleA
     f.argtypes = [POINTER(c_char), POINTER(c_char), ULONG, PLUID, PVOID, PVOID, PVOID, PCredHandle, PTimeStamp]
-    f.restype = ULONG; f.errcheck = _check_sec
+    f.restype = ULONG
+    f.errcheck = _check_sec
 
     pn = create_string_buffer(pkg_name.encode("ascii"))
-    creds = CredHandle(); ts = TimeStamp()
+    creds = CredHandle()
+    ts = TimeStamp()
     f(None, pn, cred_usage, None, None, None, None, byref(creds), byref(ts))
     return creds
 
@@ -265,11 +410,13 @@ def InitializeSecurityContext(creds, spn, flags, ctx_in=None, token=None):
     f = secur32.InitializeSecurityContextA
     f.argtypes = [PCredHandle, PCtxtHandle, POINTER(c_char), ULONG, ULONG, ULONG,
                   PSecBufferDesc, ULONG, PCtxtHandle, PSecBufferDesc, PULONG, PTimeStamp]
-    f.restype = ULONG; f.errcheck = _check_sec
+    f.restype = ULONG
+    f.errcheck = _check_sec
 
     pspn = create_string_buffer(spn.encode("ascii"))
     outbuf = SecBufferDesc()
-    outflags = ULONG(); expiry = TimeStamp()
+    outflags = ULONG()
+    expiry = TimeStamp()
     ctx_out = CtxtHandle()
 
     if token is not None:
@@ -303,7 +450,7 @@ def _build_retrieve_request(target, luid=0):
         _fields_ = [
             ("MessageType", ULONG),
             ("LogonId", LUID),
-            ("TargetName", LSA_UNICODE_STRING),
+            ("TargetName", LsaUnicodeString),
             ("TicketFlags", ULONG),
             ("CacheOptions", ULONG),
             ("EncryptionType", LONG),
@@ -321,12 +468,12 @@ def _build_retrieve_request(target, luid=0):
     req.CredentialsHandle = None
     req.TargetNameData = (c_byte * target_alloc)(*target_enc)
 
-    # Point LSA_UNICODE_STRING.Buffer to the trailing name bytes
+    # Point LsaUnicodeString.Buffer to the trailing name bytes
     struct_end = addressof(req) + sizeof(req)
     name_start = struct_end - target_alloc
     name_start_aligned = name_start - (name_start % sizeof(c_void_p))
 
-    lsa_target = LSA_UNICODE_STRING()
+    lsa_target = LsaUnicodeString()
     lsa_target.Length = len(target.encode("utf-16-le"))
     lsa_target.MaximumLength = target_alloc
     lsa_target.Buffer = cast(name_start_aligned, POINTER(c_char))
@@ -464,6 +611,7 @@ def main():
     args = ap.parse_args()
 
     raw_ticket = []
+
     def _cb(t):
         raw_ticket.append(t)
 
