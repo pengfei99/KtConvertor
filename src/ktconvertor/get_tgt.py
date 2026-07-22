@@ -34,7 +34,8 @@ from ctypes import (
 )
 # HANDLE, LONG: Windows-specific type abstractions for system handles (void*) and signed 32-bit integers (long).
 from ctypes.wintypes import HANDLE, LONG
-from typing import TypedDict
+from enum import IntEnum
+from typing import TypedDict, Tuple
 
 from asn1crypto import core
 from minikerberos.protocol.asn1_structs import AP_REQ, KRB_CRED, EncryptedData, Authenticator, EncKrbCredPart
@@ -44,6 +45,19 @@ from minikerberos.protocol.structures import AuthenticatorChecksum, ChecksumFlag
 # Platform Guard: Ensure ctypes Windows definitions fail fast on non-Windows environments
 if sys.platform != "win32":
     raise ImportError("This tool is designed for Windows only.")
+# ============================================================
+#  Constants
+# ============================================================
+KerbRetrieveEncodedTicketMessage = 8
+
+SEC_E_OK = 0x00000000
+SEC_E_CONTINUE_NEEDED = 0x00090312
+
+SECPKG_CRED_OUTBOUND = 2
+
+ISC_REQ_DELEGATE = 0x00000001
+ISC_REQ_MUTUAL_AUTH = 0x00000002
+ISC_REQ_ALLOCATE_MEMORY = 0x00000100
 
 # ============================================================
 #  These lines establish C-style naming conventions mirroring standard Windows SDK headers
@@ -199,7 +213,19 @@ class KerbCryptoKey(Structure):
         }
 
 
-class KERB_EXTERNAL_TICKET(Structure):
+class KerbExternalTicketDataDict(TypedDict):
+    """Type definition for the dictionary payload returned by KerbExternalTicket.get_data()."""
+    Key: KerbCryptoKeyDict
+    Ticket: bytes
+
+
+class KerbExternalTicket(Structure):
+    """Represents the native Windows KERB_EXTERNAL_TICKET structure (ntsecapi.h).
+
+        Used by Local Security Authority (LSA) authentication packages (e.g.,
+        `KerbRetrieveEncodedTicketMessage`) to return an encoded Kerberos ticket
+        along with its associated session key, timestamps, and target metadata.
+    """
     _fields_ = [
         ("ServiceName", PVOID),
         ("TargetName", PVOID),
@@ -219,85 +245,192 @@ class KERB_EXTERNAL_TICKET(Structure):
         ("EncodedTicket", PVOID),
     ]
 
-    def get_data(self):
-        return {"Key": self.SessionKey.to_dict(), "Ticket": string_at(self.EncodedTicket, self.EncodedTicketSize)}
+    @property
+    def ticket_bytes(self) -> bytes:
+        """
+        Safely extract raw encoded Kerberos ticket bytes from EncodedTicket.
+        :return: Raw binary ticket data, or b"" if EncodedTicket is NULL or size is 0.
+        """
+        # Guard against NULL pointer dereferences or zero-size buffers
+        if not self.EncodedTicket or self.EncodedTicketSize == 0:
+            return b""
+        return string_at(self.EncodedTicket, self.EncodedTicketSize)
+
+    def get_data(self) -> KerbExternalTicketDataDict:
+        """
+        Extract the session key metadata dictionary and raw ticket bytes.
+        :return: A typed dictionary containing 'Key' and 'Ticket'.
+        """
+        return {"Key": self.SessionKey.to_dict(), "Ticket": self.ticket_bytes}
 
 
-class KERB_RETRIEVE_TKT_RESPONSE(Structure):
-    _fields_ = [("Ticket", KERB_EXTERNAL_TICKET)]
+class KerbRetrieveTktResponse(Structure):
+    """Represents the native Windows KERB_RETRIEVE_TKT_RESPONSE structure (ntsecapi.h).
+
+        This structure is returned in the output response buffer by `LsaCallAuthenticationPackage`
+        when calling with `KerbRetrieveEncodedTicketMessage`. It wraps the retrieved external
+        Kerberos ticket along with its session key and metadata.
+    """
+    _fields_ = [("Ticket", KerbExternalTicket)]
+
+    @property
+    def ticket_data(self) -> KerbExternalTicketDataDict:
+        """
+        Convenience property to extract session key metadata and raw ticket bytes.
+        :return: A typed dictionary containing 'Key' and 'Ticket'.
+        """
+        return self.Ticket.get_data()
 
 
 # ============================================================
 #  SSPI structures
+# In Windows SSPI (sspi.h), credentials and security contexts use identical memory structures under the hood.
+# Microsoft defines them as typedef aliases of SecHandle
+# typedef struct _SecHandle {
+#     ULONG_PTR dwLower;
+#     ULONG_PTR dwUpper;
+# } SecHandle, *PSecHandle;
+
+# typedef SecHandle CredHandle, *PCredHandle;
+# typedef SecHandle CtxtHandle, *PCtxtHandle;
 # ============================================================
 
 class SecHandle(Structure):
-    _fields_ = [("dwLower", POINTER(ULONG)), ("dwUpper", POINTER(ULONG))]
+    """Represents the native Windows SecHandle structure (sspi.h).
+
+        In the Windows Security Support Provider Interface (SSPI), SecHandle is the
+        foundational structure used to represent opaque security context and credential
+        handles. It consists of two pointer-sized lower and upper integer values.
+    """
+    _fields_ = [
+        ("dwLower", POINTER(ULONG)),
+        ("dwUpper", POINTER(ULONG))
+    ]
 
     def __init__(self):
         super().__init__(pointer(ULONG()), pointer(ULONG()))
 
 
+# Credential Handle Aliases (used in AcquireCredentialsHandle)
 CredHandle = SecHandle
 PCredHandle = POINTER(CredHandle)
+# Security Context Handle Aliases (used in InitializeSecurityContext / AcceptSecurityContext)
 CtxtHandle = SecHandle
 PCtxtHandle = POINTER(CtxtHandle)
 
 
 class TimeStamp(Structure):
+    """Represents the native Windows TimeStamp / FILETIME structure (sspi.h / minwinbase.h).
+
+        Contains a 64-bit value representing the number of 100-nanosecond intervals
+        elapsed since 12:00 A.M. January 1, 1601 (UTC).
+    """
     _fields_ = [("dwLowDateTime", ULONG), ("dwHighDateTime", ULONG)]
 
 
+# Module-level cached pointer type definition (sspi.h)
 PTimeStamp = POINTER(TimeStamp)
 
 
+class SecBufferType(IntEnum):
+    """Standard SSPI Security Buffer Types (sspi.h)."""
+
+    EMPTY = 0
+    DATA = 1
+    TOKEN = 2
+    PKG_PARAMS = 3
+    STREAM_HEADER = 6
+    STREAM_TRAILER = 7
+
+
 class SecBuffer(Structure):
+    """Represents the native Windows SecBuffer structure (sspi.h).
+
+        Used by Security Support Provider Interface (SSPI) functions to exchange
+        security tokens, authentication descriptors, and decrypted payloads.
+    """
     _fields_ = [("cbBuffer", ULONG), ("BufferType", ULONG), ("pvBuffer", PVOID)]
 
-    def __init__(self, token=None, buffer_type=2):
+    def __init__(self, token: bytes | bytearray | int | None = None,
+                 buffer_type: int | SecBufferType = SecBufferType.TOKEN):
+        """
+        Initialize a SecBuffer instance.
+        :param token: Initial byte payload, integer capacity to pre-allocate, or None to allocate a default 2,880-byte buffer.
+        :param buffer_type: SSPI buffer type flag (defaults to SECBUFFER_TOKEN = 2).
+        """
         if token is None:
+            # Default initial allocation size for SSPI security tokens
             token = b"\x00" * 2880
-        self._buf = create_string_buffer(token, len(token))  # keep ref alive!
+        # Allocate buffer and anchor reference on self to prevent Garbage Collection
+        self._buf = create_string_buffer(token, len(token))
+
         super().__init__(sizeof(self._buf), buffer_type, cast(self._buf, PVOID))
 
     @property
-    def Buffer(self):
-        return (self.BufferType, string_at(self.pvBuffer, self.cbBuffer))
+    def raw_bytes(self) -> bytes:
+        """
+        Safely extract raw bytes from the pvBuffer memory location.
+        :return: The raw byte payload, or b"" if pvBuffer is NULL or size is 0.
+        """
+        if not self.pvBuffer or self.cbBuffer == 0:
+            return b""
+        return string_at(self.pvBuffer, self.cbBuffer)
+
+    @property
+    def Buffer(self) -> Tuple[int, bytes]:
+        return int(self.BufferType), self.raw_bytes
+
+    def __repr__(self) -> str:
+        """Return a developer-friendly representation of the buffer state."""
+        try:
+            type_name = SecBufferType(self.BufferType).name
+        except ValueError:
+            type_name = f"CUSTOM({self.BufferType})"
+        return f"<{self.__class__.__name__} type={type_name} size={self.cbBuffer} bytes>"
+
+
+SECBUFFER_VERSION = 0  # Standard SECBUFFER_VERSION constant from sspi.h
 
 
 class SecBufferDesc(Structure):
-    _fields_ = [("ulVersion", ULONG), ("cBuffers", ULONG), ("pBuffers", POINTER(SecBuffer))]
+    """Represents the native Windows SecBufferDesc structure (sspi.h).
+
+        Serves as an array descriptor container for one or more SecBuffer structures,
+        exchanged during SSPI authentication calls such as InitializeSecurityContext
+        and AcceptSecurityContext.
+    """
+    _fields_ = [
+        ("ulVersion", ULONG),
+        ("cBuffers", ULONG),
+        ("pBuffers", POINTER(SecBuffer))
+    ]
 
     def __init__(self, sb=None):
         if sb is not None:
             # keep elements alive via a slice copy
             arr = (SecBuffer * len(sb))(*sb)
             self._buf = arr  # keep ref
-            super().__init__(0, len(sb), arr)
+            # 3. Initialize Base C Structure
+            super().__init__(SECBUFFER_VERSION, len(sb), arr)
         else:
             self._buf = SecBuffer()
-            super().__init__(0, 1, pointer(self._buf))
+            super().__init__(SECBUFFER_VERSION, 1, pointer(self._buf))
 
     @property
     def Buffers(self):
+        """Legacy compatibility property matching original C API naming."""
         return [self.pBuffers[i].Buffer for i in range(self.cBuffers)]
 
+    def __repr__(self) -> str:
+        """Return an informative string representation."""
+        return f"<{self.__class__.__name__} version={self.ulVersion} count={self.cBuffers}>"
 
+    def __len__(self) -> int:
+        """Return the number of buffers in the descriptor."""
+        return int(self.cBuffers)
+
+# Module-level cached pointer type definition
 PSecBufferDesc = POINTER(SecBufferDesc)
-
-# ============================================================
-#  Constants
-# ============================================================
-KerbRetrieveEncodedTicketMessage = 8
-
-SEC_E_OK = 0x00000000
-SEC_E_CONTINUE_NEEDED = 0x00090312
-
-SECPKG_CRED_OUTBOUND = 2
-
-ISC_REQ_DELEGATE = 0x00000001
-ISC_REQ_MUTUAL_AUTH = 0x00000002
-ISC_REQ_ALLOCATE_MEMORY = 0x00000100
 
 # ============================================================
 #  WinAPI — LSA
@@ -307,7 +440,7 @@ ISC_REQ_ALLOCATE_MEMORY = 0x00000100
 #
 # This line grants Python direct access to lower-level Windows Security APIs, such as the SSPI (Security Support Provider Interface)
 # and LSA (Local Security Authority) functions.
-secur32 = ctypes.windll.Secur32
+_secur32 = ctypes.windll.Secur32
 
 
 def _check_nt(result, func, args):
@@ -317,7 +450,7 @@ def _check_nt(result, func, args):
 
 
 def LsaConnectUntrusted():
-    f = secur32.LsaConnectUntrusted
+    f = _secur32.LsaConnectUntrusted
     f.argtypes = [PHANDLE]
     f.restype = NTSTATUS
     f.errcheck = _check_nt
@@ -327,7 +460,7 @@ def LsaConnectUntrusted():
 
 
 def LsaDeregisterLogonProcess(h):
-    f = secur32.LsaDeregisterLogonProcess
+    f = _secur32.LsaDeregisterLogonProcess
     f.argtypes = [HANDLE]
     f.restype = NTSTATUS
     f.errcheck = _check_nt
@@ -335,7 +468,7 @@ def LsaDeregisterLogonProcess(h):
 
 
 def LsaFreeReturnBuffer(p):
-    f = secur32.LsaFreeReturnBuffer
+    f = _secur32.LsaFreeReturnBuffer
     f.argtypes = [PVOID]
     f.restype = NTSTATUS
     f.errcheck = _check_nt
@@ -343,7 +476,7 @@ def LsaFreeReturnBuffer(p):
 
 
 def LsaLookupAuthenticationPackage(h, pkg):
-    f = secur32.LsaLookupAuthenticationPackage
+    f = _secur32.LsaLookupAuthenticationPackage
     f.argtypes = [HANDLE, PLsaString, PULONG]
     f.restype = NTSTATUS
     f.errcheck = _check_nt
@@ -363,7 +496,7 @@ def LsaCallAuthenticationPackage(lsa_handle, pkg_id, msg):
     Returns (response_bytes, free_ptr, ret_status).
     Caller must LsaFreeReturnBuffer(free_ptr) once response parsing is done.
     """
-    f = secur32.LsaCallAuthenticationPackage
+    f = _secur32.LsaCallAuthenticationPackage
     f.argtypes = [HANDLE, ULONG, PVOID, ULONG, PPVOID, PULONG, PNTSTATUS]
     f.restype = ULONG
     f.errcheck = _check_nt
@@ -394,7 +527,7 @@ def _check_sec(result, func, args):
 
 
 def AcquireCredentialsHandle(pkg_name, cred_usage):
-    f = secur32.AcquireCredentialsHandleA
+    f = _secur32.AcquireCredentialsHandleA
     f.argtypes = [POINTER(c_char), POINTER(c_char), ULONG, PLUID, PVOID, PVOID, PVOID, PCredHandle, PTimeStamp]
     f.restype = ULONG
     f.errcheck = _check_sec
@@ -407,7 +540,7 @@ def AcquireCredentialsHandle(pkg_name, cred_usage):
 
 
 def InitializeSecurityContext(creds, spn, flags, ctx_in=None, token=None):
-    f = secur32.InitializeSecurityContextA
+    f = _secur32.InitializeSecurityContextA
     f.argtypes = [PCredHandle, PCtxtHandle, POINTER(c_char), ULONG, ULONG, ULONG,
                   PSecBufferDesc, ULONG, PCtxtHandle, PSecBufferDesc, PULONG, PTimeStamp]
     f.restype = ULONG
@@ -490,7 +623,7 @@ def extract_ticket(lsa_handle, pkg_id, luid, target):
     ret_msg, free_ptr, ret_status = LsaCallAuthenticationPackage(lsa_handle, pkg_id, msg)
     if ret_status != 0:
         raise WinError(ret_status)
-    resp = KERB_RETRIEVE_TKT_RESPONSE.from_buffer_copy(ret_msg)
+    resp = KerbRetrieveTktResponse.from_buffer_copy(ret_msg)
     ticket_data = resp.Ticket.get_data()
     if free_ptr is not None:
         LsaFreeReturnBuffer(free_ptr)
