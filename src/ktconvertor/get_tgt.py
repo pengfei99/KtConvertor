@@ -429,6 +429,7 @@ class SecBufferDesc(Structure):
         """Return the number of buffers in the descriptor."""
         return int(self.cBuffers)
 
+
 # Module-level cached pointer type definition
 PSecBufferDesc = POINTER(SecBufferDesc)
 
@@ -443,55 +444,65 @@ PSecBufferDesc = POINTER(SecBufferDesc)
 _secur32 = ctypes.windll.Secur32
 
 
-def _check_nt(result, func, args):
+def _check_nt(result: int, _func: object, _args: object) -> int:
+    """ctypes errcheck callback for NTSTATUS functions (0x80000000+ = Warning/Error)."""
     if result != 0:
         raise WinError(result)
     return result
 
 
-def LsaConnectUntrusted():
+def LsaConnectUntrusted() -> HANDLE:
+    """Establish an untrusted connection to the LSA server."""
     f = _secur32.LsaConnectUntrusted
     f.argtypes = [PHANDLE]
     f.restype = NTSTATUS
     f.errcheck = _check_nt
-    h = HANDLE(-1)
-    f(byref(h))
-    return h
+    handle = HANDLE(-1)
+    f(byref(handle))
+    return handle
 
 
-def LsaDeregisterLogonProcess(h):
+def LsaDeregisterLogonProcess(lsa_handle: HANDLE) -> None:
+    """Disconnect and release an active LSA logon process connection handle."""
     f = _secur32.LsaDeregisterLogonProcess
     f.argtypes = [HANDLE]
     f.restype = NTSTATUS
     f.errcheck = _check_nt
-    f(h)
+    f(lsa_handle)
 
 
-def LsaFreeReturnBuffer(p):
+def LsaFreeReturnBuffer(pointer_address: PVOID) -> None:
+    """Free a memory buffer allocated and returned by LSA calls."""
     f = _secur32.LsaFreeReturnBuffer
     f.argtypes = [PVOID]
     f.restype = NTSTATUS
     f.errcheck = _check_nt
-    f(p)
+    f(pointer_address)
 
 
-def LsaLookupAuthenticationPackage(h, pkg):
+def LsaLookupAuthenticationPackage(lsa_handle: HANDLE, package_name: str | bytes) -> int:
+    """
+    Lookup the package ID for a specified authentication package (e.g., 'MICROSOFT_AUTHENTICATION_PACKAGE_V1_0').
+    :param lsa_handle: lsa handle
+    :param package_name: package name
+    :return:
+    """
     f = _secur32.LsaLookupAuthenticationPackage
     f.argtypes = [HANDLE, PLsaString, PULONG]
     f.restype = NTSTATUS
     f.errcheck = _check_nt
 
-    b = pkg.encode() if isinstance(pkg, str) else pkg
+    b = package_name.encode() if isinstance(package_name, str) else package_name
     s = LsaString()
     s.Buffer = create_string_buffer(b)
     s.Length = len(b)
     s.MaximumLength = len(b) + 1
     pid = ULONG(0)
-    f(h, byref(s), byref(pid))
+    f(lsa_handle, byref(s), byref(pid))
     return pid.value
 
 
-def LsaCallAuthenticationPackage(lsa_handle, pkg_id, msg):
+def LsaCallAuthenticationPackage(lsa_handle: HANDLE, pkg_id: int, msg: bytes | Structure | PVOID, ):
     """
     Returns (response_bytes, free_ptr, ret_status).
     Caller must LsaFreeReturnBuffer(free_ptr) once response parsing is done.
