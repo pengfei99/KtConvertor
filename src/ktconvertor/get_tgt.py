@@ -163,6 +163,7 @@ class LsaUnicodeString(Structure):
         lus.MaximumLength = len(enc) + 1
         # 'Length' is byte count EXCLUDING the null terminator
         lus.Length = len(enc)
+        lus._keep_alive = buf
         return lus
 
     def to_string(self):
@@ -170,7 +171,9 @@ class LsaUnicodeString(Structure):
         Decode the underlying UTF-16-LE C buffer into a native Python string.
         :return: The decoded string, or an empty string if the Buffer is NULL or Length is 0.
         """
-        return string_at(self.Buffer, self.MaximumLength).decode("utf-16-le", errors="replace").rstrip("\x00")
+        if not self.Buffer or self.Length == 0:
+            return ""
+        return string_at(self.Buffer, self.Length).decode("utf-16-le", errors="strict")
 
 
 class KerbCryptoKeyDict(TypedDict):

@@ -3,11 +3,9 @@ import base64
 import pathlib
 import struct
 import sys
-import tempfile
-import subprocess
 import pytest
 
-from config import get_testfiles_kirbi, KIRBI_DIR
+from config import get_testfiles_kirbi
 from ktconvertor.kirbi2ccache import kirbi_to_ccache
 
 SCRIPT = pathlib.Path(__file__).resolve().parent.parent / "src/ktconvertor" / 'kirbi2ccache.py'

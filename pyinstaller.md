@@ -13,9 +13,11 @@ pyinstaller --onefile --name convert-tgt --hidden-import=minikerberos --hidden-i
 ```
 
 You should find the output of the pyinstaller inside `dist/`:
+
 - standalone executable: `dist/convert-tgt.exe`
-- source file: ``
-- 
+- source file:
+- wheel file:
+
 ## Troubleshooting
 
 If the exe crashes with `ModuleNotFoundError` at runtime, rebuild with explicit hidden imports:
