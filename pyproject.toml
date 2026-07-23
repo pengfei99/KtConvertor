@@ -1,6 +1,6 @@
 [project]
 name = "ktconvertor"
-version = "0.3.0"
+version = "0.1.0"
 description = "This tool fetch a kerberos TGT ticket of the current user in raw kirbi bytes, and convert kerberos ticket of format .kirbi to standard MIT CCACHE format"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -15,7 +15,6 @@ keywords = ["kerberos", "ccache", ]
 dependencies = [
     "minikerberos",
     "asn1crypto",
-    "pyinstaller>=6.21.0",
 ]
 
 [project.optional-dependencies]
@@ -26,6 +25,7 @@ dev = [
     "black>=23.0", # Code formatter
     "isort>=5.12", # Import sorter
     "mypy>=1.0", # Added for type checking
+    "pyinstaller>=6.21.0", # for building .exe
 ]
 
 [project.urls]
