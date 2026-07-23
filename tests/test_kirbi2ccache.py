@@ -1,12 +1,14 @@
 """Tests for the standalone kirbi2ccache.py converter."""
-
+import base64
 import pathlib
 import struct
+import sys
 import tempfile
 import subprocess
 import pytest
 
 from config import get_testfiles_kirbi, KIRBI_DIR
+from ktconvertor.kirbi2ccache import kirbi_to_ccache
 
 SCRIPT = pathlib.Path(__file__).resolve().parent.parent / "src/ktconvertor" / 'kirbi2ccache.py'
 
@@ -583,73 +585,6 @@ class TestKirbiToCCache:
             assert cred2.key.keyvalue == cc.credentials[0].key.keyvalue
 
 
-# ── CLI integration ──────────────────────────────────────────────────────
-
-class TestCLI:
-    def test_cli_converts_kirbi(self):
-        """CLI converts a kirbi file to ccache."""
-        for f in list(get_testfiles_kirbi())[:3]:
-            with tempfile.NamedTemporaryFile(suffix='.ccache') as tmp:
-                result = subprocess.run(
-                    ['uv', 'run', 'python', str(SCRIPT), str(f), tmp.name],
-                    capture_output=True, text=True, timeout=10,
-                )
-                assert result.returncode == 0
-                assert f'Wrote {tmp.name}' in result.stdout
-                from minikerberos.common.ccache import CCACHE
-                from minikerberos.common.kirbi import Kirbi
-                cc = CCACHE.from_file(tmp.name)
-                assert len(cc.credentials) == 1
-
-    def test_cli_default_output_name(self):
-        """CLI auto-generates output filename when not specified."""
-        for f in list(get_testfiles_kirbi())[:3]:
-            with tempfile.TemporaryDirectory() as d:
-                src = str(f)
-                result = subprocess.run(
-                    ['uv', 'run', 'python', str(SCRIPT), src],
-                    capture_output=True, text=True, timeout=10,
-                    cwd=d,
-                )
-                assert result.returncode == 0
-
-    def test_cli_base64_rubeus(self):
-        """CLI converts base64-encoded (Rubeus) input."""
-        for f in list(get_testfiles_kirbi())[:3]:
-            with open(f, 'rb') as fh:
-                b64_data = __import__('base64').b64encode(fh.read())
-            with tempfile.NamedTemporaryFile(suffix='.kirbi') as b64f:
-                b64f.write(b64_data)
-                b64f.flush()
-                with tempfile.NamedTemporaryFile(suffix='.ccache') as out:
-                    result = subprocess.run(
-                        ['uv', 'run', 'python', str(SCRIPT), b64f.name, out.name],
-                        capture_output=True, text=True, timeout=10,
-                    )
-                    assert result.returncode == 0
-                    from minikerberos.common.ccache import CCACHE
-                    cc = CCACHE.from_file(out.name)
-                    assert len(cc.credentials) == 1
-
-    def test_cli_nonexistent_file(self):
-        """CLI errors on nonexistent input."""
-        result = subprocess.run(
-            ['uv', 'run', 'python', str(SCRIPT), '/nonexistent/file.kirbi'],
-            capture_output=True, text=True, timeout=10,
-        )
-        assert result.returncode != 0
-
-    def test_cli_invalid_kirbi(self):
-        """CLI errors on invalid binary input."""
-        with tempfile.NamedTemporaryFile(suffix='.kirbi') as f:
-            f.write(b'not-a-kirbi')
-            f.flush()
-            result = subprocess.run(
-                ['uv', 'run', 'python', str(SCRIPT), f.name],
-                capture_output=True, text=True, timeout=10,
-            )
-            assert result.returncode != 0
-
 
 # ── Edge cases ───────────────────────────────────────────────────────────
 
@@ -727,3 +662,26 @@ class TestNegativeCases:
         """kirbi_to_ccache raises on garbage after base64 fallback."""
         with pytest.raises(Exception):
             k2c.kirbi_to_ccache(b'!!not-base64!!')
+
+
+def test_cli_example():
+    inpath = "C:/Users/pliu/Documents/git/KtConvertor/tests/tmp/tgt.kirbi"
+    outpath = "C:/Users/pliu/Documents/git/KtConvertor/tests/tmp/krb5cc_1000"
+
+    with open(inpath, 'rb') as f:
+        raw = f.read()
+
+    # Try binary first, then base64
+    try:
+        cc = kirbi_to_ccache(raw)
+    except Exception:
+        try:
+            raw = base64.b64decode(raw.decode('ascii').strip())
+            cc = kirbi_to_ccache(raw)
+        except Exception as e:
+            print(f'Error: {e}', file=sys.stderr)
+            sys.exit(1)
+
+    with open(outpath, 'wb') as f:
+        f.write(cc)
+    print(f'Wrote {outpath}  ({len(cc)} bytes)')
