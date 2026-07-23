@@ -121,7 +121,7 @@ typedef struct _STRING {
 class LsaString(Structure):
     """
     It defines a C-compatible memory layout for the Windows LSA_STRING structure using Python's ctypes module
-    Length:	USHORT (16-bit), The actual byte count of the data stored in Buffer (excluding any trailing null character).
+    Length:     USHORT (16-bit), The actual byte count of the data stored in Buffer (excluding any trailing null character).
     MaximumLength: USHORT (16-bit), The total memory allocated for Buffer in bytes.
     Buffer: POINTER(c_char), A pointer to a C character array (char*) holding the raw bytes in memory.
     """
@@ -161,7 +161,6 @@ class LsaUnicodeString(Structure):
         buf = create_string_buffer(enc, len(enc))
         lus.Buffer = cast(buf, POINTER(c_char))
         lus.MaximumLength = len(enc) + 1
-        # 'Length' is byte count EXCLUDING the null terminator
         lus.Length = len(enc)
         lus._keep_alive = buf
         return lus
