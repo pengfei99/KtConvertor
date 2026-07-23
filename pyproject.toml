@@ -15,7 +15,7 @@ keywords = ["kerberos", "ccache", ]
 dependencies = [
     "minikerberos",
     "asn1crypto",
-    "typer",
+    "pyinstaller>=6.21.0",
 ]
 
 [project.optional-dependencies]
@@ -33,7 +33,7 @@ dev = [
 
 [project.scripts]
 # This allows the user to run 'convert-tgt' directly in the terminal
-convert-tgt = "ktconvertor.main:app"
+get-tgt = "ktconvertor.main:main"
 
 [build-system]
 requires = ["setuptools>=61.0"]

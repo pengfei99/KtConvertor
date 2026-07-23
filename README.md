@@ -16,35 +16,18 @@ There are existing tools:
 
 ## 🚀 Key Features
 
-* **Smart Pathing:** Automatically detects the correct Kerberos cache path for your OS (following XDG standards on
-  Linux).
-* **Safe I/O:** Atomic file writes and automatic directory creation.
-* **Modern CLI:** Built with `Typer` and `Rich` for beautiful, informative terminal output.
+* **Smart Pathing:** Automatically detects the correct Kerberos cache path for you (Only for windows)
+* **Safe I/O:** Atomic kerberos ccache file writes and overwrites.
 * **Developer Friendly:** Fully type-hinted and optimized for use with `uv`.
 
 ## 🚀 Quick Start
 
-This tool is released as a python package and executable. You need to have `python` and `pip` to install it.
+This tool is released as a python package and executable. To install it as a python package, you need to have 
+`python virtual env` and `pip` to install it.
 
-### Build your local environment
+If you want to use it as an executable, you only need to download the `convert-tgt.exe`
 
-As we mentioned before, this tool may build locally the `.whl` files. So if the `OS, CPU architecture or python 
-version` of your build environment are not compatible with the target machine, the downloaded or generated `.whl` will
-not be compatible in the target machine. The python version which you use to run the tool will define the downloaded
-installed
-
-Before build your local environment, check the below things:
-
-- What is the `OS` of your target machine? (e.g. Windows, Linux, MacOS)
-- What is the `CPU architecture` of your target machine? (e.g. x86, ARM, etc.)
-- What is the `python version` of your target python environment (e.g. 3.11, 3.12, etc.)
-
-For example if you target environment is a `Windows Server 2019` with `x86` CPU and `python 3.11`. Your local
-environment
-should also be `Windows, x86, and python 3.11`.
-
-> We recommend you to use a virtual environment to run the tool.
-> Your local environment must have internet access.
+### Build your python virtual environment with conda
 
 For example, you can create a virtual environment for python 3.11 with conda.
 
@@ -52,15 +35,17 @@ For example, you can create a virtual environment for python 3.11 with conda.
 conda create --name my_test python=3.11
 ```
 
-### Installation
-
-Here we suppose you already have the required `python`, `pip` and `virtual environment`.
+### Build your python virtual environment with uv
 
 ```powershell
-pip install ktconvertor
+# clone the repo git
+
+# use uv to create virtual env
+uv sync
 ```
 
-### Basic Usage
+
+## Basic Usage
 
 After installation, you can view all available options of the tool with `convert-tgt.exe --help`
 
