@@ -10,7 +10,7 @@ authors = [
 ]
 license = { text = "MIT" }
 
-keywords = ["kerberos", "ccache", ]
+keywords = ["Windows", "kerberos", "TGT", "ccache", ]
 
 dependencies = [
     "minikerberos",
@@ -36,15 +36,16 @@ dev = [
 get-tgt = "ktconvertor.main:main"
 
 [build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
+# uv sync will install hatchling automatically, I don't need to add it to project dependencies
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
-# Modern project tip: Add configuration for your tools here
+[tool.hatch.build.targets.wheel]
+packages = ["src/ktconvertor"]
+
 [tool.black]
 line-length = 88
 
 [tool.isort]
 profile = "black"
 
-[tool.setuptools.packages.find]
-where = ["src"]  # Tells setuptools to look inside the src folder
